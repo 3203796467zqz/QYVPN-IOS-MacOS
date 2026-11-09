@@ -21,7 +21,7 @@ printf 'apiToken=你的令牌\n' > .private/client.properties
 | 工具 | 版本 | 用途 |
 | --- | --- | --- |
 | Xcode | 15 或更新 | 编译 Swift、打包 ipa |
-| Go | 1.21+ | 编译 `core/` 内核 |
+| Go | 1.26+ | 编译 `core/` 内核（gomobile 对 Go 版本有要求） |
 | gomobile | 最新 | 把 Go 编译成 `Engine.xcframework`（`build.sh` 会自动安装） |
 | XcodeGen | 最新 | 由 `ios/app/project.yml` 生成 Xcode 工程 |
 

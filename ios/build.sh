@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # 构建清幽加速器 iOS 客户端：Go 连接内核（gomobile）+ SwiftUI 界面 + 隧道扩展。
-# 只在 macOS 上运行（需要 Xcode、Go 1.21+、xcodegen、gomobile）。
+# 只在 macOS 上运行（需要 Xcode、Go 1.26+、xcodegen；gomobile 由脚本自动安装）。
 #
 # 用法：
 #   ./build.sh                      # 编译内核 → 生成工程 → archive → 导出 ipa
@@ -65,7 +65,7 @@ command -v xcodebuild >/dev/null || { echo "缺少 xcodebuild：请安装 Xcode"
 xcodebuild -version | head -2
 command -v xcodegen >/dev/null || { echo "缺少 xcodegen：brew install xcodegen"; exit 1; }
 if [ "$SKIP_ENGINE" = "0" ]; then
-  command -v go >/dev/null || { echo "缺少 go：请安装 Go 1.21+"; exit 1; }
+  command -v go >/dev/null || { echo "缺少 go：请安装 Go 1.26+"; exit 1; }
   go version
 fi
 
@@ -109,9 +109,27 @@ if [ "$SKIP_ENGINE" = "0" ]; then
 
   mkdir -p "$FRAMEWORK_DIR"
   echo "==> 编译 Go 内核（target=${GOMOBILE_TARGET}）"
-  ( cd "$ENGINE_DIR" && \
+
+  # 新版 gomobile 要求「被 bind 的模块」把 golang.org/x/mobile 声明成工具依赖，
+  # 否则直接报 "missing golang.org/x/mobile dependency"。
+  # 但内核是刻意保持零依赖的（macOS 客户端要 CGO_ENABLED=0 离线编译），
+  # 所以不往 go.mod 里塞依赖，而是复制一份临时副本、在副本上加工具依赖再 bind。
+  BIND_DIR="$ENGINE_DIR"
+  if ! grep -q "golang.org/x/mobile" "$ENGINE_DIR/go.mod"; then
+    BIND_DIR="$(mktemp -d)/engine"
+    mkdir -p "$BIND_DIR"
+    cp -R "$ENGINE_DIR"/. "$BIND_DIR"/
+    echo "    准备 gomobile 工具依赖（临时副本，不改仓库的 go.mod）"
+    ( cd "$BIND_DIR" && go get -tool golang.org/x/mobile/cmd/gobind@latest >/dev/null ) || {
+      echo "无法解析 golang.org/x/mobile 工具依赖，请检查网络或 Go 版本（需 1.26+）" >&2
+      exit 1
+    }
+  fi
+
+  ( cd "$BIND_DIR" && \
     gomobile bind -target="$GOMOBILE_TARGET" -ldflags "$LDFLAGS" \
       -o "$FRAMEWORK_DIR/Engine.xcframework" ./mobile )
+  [ "$BIND_DIR" = "$ENGINE_DIR" ] || rm -rf "$(dirname "$BIND_DIR")"
   echo "    框架：$FRAMEWORK_DIR/Engine.xcframework"
 else
   [ -d "$FRAMEWORK_DIR/Engine.xcframework" ] || {

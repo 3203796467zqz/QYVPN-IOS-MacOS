@@ -49,7 +49,7 @@ ios/
 
 ## 二、构建
 
-在 Mac 上（需要 Xcode 15+、Go 1.21+）：
+在 Mac 上（需要 Xcode 15+、Go 1.26+）：
 
 ```bash
 brew install xcodegen
