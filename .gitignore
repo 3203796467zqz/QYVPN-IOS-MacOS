@@ -2,8 +2,10 @@
 ios/build/
 ios/app/Frameworks/
 ios/app/QYVPN.xcodeproj/
+macos/dist/
 *.ipa
 *.xcarchive
+*.app
 DerivedData/
 xcuserdata/
 

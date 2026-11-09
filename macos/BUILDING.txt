@@ -1,0 +1,155 @@
+清幽私人云 macOS 客户端 1.0.0
+
+组成
+----
+界面：Swift / SwiftUI（macOS 13+），源码在 macos/app，用 Swift Package Manager 构建，
+      不需要 .xcodeproj，也不需要 Xcode 图形界面。
+内核：Go 1.21+（开发机用 Go 1.27.3 验证），源码在 macos/engine，零第三方依赖
+      （MD4/DES/MSCHAPv2 自实现，只用标准库），因此可以离线构建。
+打包：macos/build.sh 一次完成内核交叉编译、lipo 通用二进制、Swift release 构建、
+      .app 组装、ad-hoc 签名、zip 打包。
+
+构建
+----
+  cd macos
+  ./build.sh              # arm64 + x86_64 通用版本，产物在 macos/dist
+  ./build.sh --arm64      # 只构建 Apple Silicon
+  QYVPN_VERSION=1.0.1 QYVPN_BUILD=2 ./build.sh
+
+客户端令牌的注入方式：build.sh 读取 QYVPN_API_TOKEN，或仓库根目录的
+.private/client.properties 里的 apiToken=，通过
+  -ldflags "-X qingyou/qyvpn/internal/cloud.DefaultToken=<token>"
+写进内核二进制（与 Windows 版随包内置令牌的做法一致）。令牌只有配置读取、
+状态读取、客户端统计上报权限，不含后台管理权限。
+没有令牌也能构建，但客户端无法同步节点。
+
+验证状态（2026-11-09，Windows 开发机）
+------------------------------------
+可离线验证的部分全部通过：
+
+1. go vet ./... 无告警；gofmt 无差异。
+2. 单元测试 31 项全部通过（go test ./... -count=1）：
+   - internal/auth：MD4 对齐 RFC 1320 全部 7 组向量；
+     MSCHAPv2 对齐 RFC 2759 §9.2 的 ChallengeHash（D0 2E 43 86 BC E9 12 26）、
+     NT-Response（8230 9ECD…D6DF）与 AuthenticatorResponse（S=407A5589…DA56），
+     并覆盖 HLAK 派生、UTF-16LE 编码。
+   - internal/sstp：CALL_CONNECT_REQUEST 逐字节比对、控制包往返、crypto binding 位图与
+     nonce 解析、CALL_CONNECTED 112 字节布局与 CMAC 确定性、DATA 帧封装。
+   - internal/ppp：帧封装/解析往返、选项编解码、越界拒绝、地址选项。
+   - internal/model：SSTP 账号 “账号@HUB” 规则、节点校验、额度/流量格式化、
+     北京时间计费月与重置天数（含跨年）、状态合并与不可用原因。
+   - internal/tunnel：`netstat -ibn` 计数行解析（含 Address 列缺失的行）、
+     `route -n get default` 解析、CIDR 归一化。
+   - internal/agent：设置读写与权限、日志脱敏与 1 MiB 轮转、账本累计/持久化/清理、
+     版本比较、内置国内网段表加载（7456 条）。
+3. 交叉编译通过：GOOS=darwin GOARCH=arm64 / amd64，两个架构均能产出二进制。
+4. 对线上真实节点完成端到端验证（不是模拟）：
+   - 通过后台 /api/app/config 取得真实节点（美国1 vpn.o166.net:443、美国2、香港）；
+   - TLS 1.3 握手 + 证书校验（Let's Encrypt 公网证书）；
+   - SSTP_DUPLEX_POST 引导返回 HTTP/1.1 200；
+   - CALL_CONNECT_REQUEST → ACK（证书哈希 SHA-256）；
+   - PPP：LCP 协商完成（服务器要求 PAP），PAP 认证通过；
+   - CALL_CONNECTED（含 CMAC 绑定）被接受；
+   - IPCP 拿到地址 10.77.88.11 / 192.168.30.11 与 DNS 1.1.1.1；
+   - 数据面：向隧道注入 ICMP Echo，成功收到 Echo Reply，流量计数 44/44 字节；
+   - 全流程约 2 秒（见 internal/session/live_api_test.go、live_data_test.go）。
+   这两项测试在没有 .private/client.properties 或 QYVPN_API_TOKEN 时自动跳过。
+
+需要在 Mac 上实测的部分（本机无法验证）
+--------------------------------------
+1. utun 创建：socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) + CTLIOCGINFO +
+   connect(sockaddr_ctl)，代码在 internal/tunnel/utun_darwin.go。syscall 用法已随
+   darwin/arm64 与 darwin/amd64 交叉编译通过，但没有真机运行。
+2. ifconfig / route / scutil 的实际效果：
+   - ifconfig utunN inet <ip> <ip> netmask 255.255.255.255 mtu 1400 up
+     （失败时退回不带 netmask 的写法）；
+   - 服务器主机路由 → 物理网关；默认路由用 0.0.0.0/1 + 128.0.0.0/1 接管；
+   - DNS 写入 State:/Network/Service/cn.qo8.qyvpn/DNS（SupplementalMatchDomains * ""）。
+   每条命令的成功/失败都会写进 connection.log，按 README 第五节逐项核对即可。
+3. 域名直连：7456 条国内网段用一份 sh 脚本一次性安装；自定义域名按解析结果加 /32 路由。
+   需要观察首连耗时与断开后的路由清理是否干净（route -n get default 应恢复原网关）。
+4. 界面：Swift 代码未在本机编译过（本机无 Swift 工具链），首次 `swift build` 可能需要
+   按编译器提示修少量语法或 API 版本问题；结构与状态管理见 app/Sources。
+5. 安装流程：osascript 管理员授权 → 内核 install → launchctl bootstrap。需要在真机确认
+   授权弹窗文案、launchd 服务是否常驻、卸载是否清理干净。
+
+后台的 macOS 通道（2026-11-09 已补齐）
+-----------------------------------
+后台 1.6.49 新增了 macOS 发布通道，客户端 /api/app/macos-release 的检查与下载现在有接口可用：
+  - 后台上传：管理后台「macOS 客户端 → 发布 macOS 版本」，选 build.sh 产出的 zip（上限 200 MB）。
+    后台自动从 .app/Contents/Info.plist 读版本号，校验 Bundle ID（cn.qo8.qyvpn.client）、
+    可执行文件与内嵌 qyvpn-engine（必须是 Mach-O），并要求版本号高于历史发布版本。
+  - 客户端检查：GET /api/app/macos-release → {release:{version,notes,sha256,size,published}}；
+    有新版本时客户端下载 /api/app/macos/<sha256>，校验大小与 SHA256 后存到
+    ~/Library/Application Support/QingyouPrivateCloud/updates/，并在 Finder 里定位，
+    安装仍需用户把 .app 拖进「应用程序」（macOS 不能原地替换运行中的程序）。
+  - 公开下载：/download/macos 优先返回正式发布的安装包（文件名带版本号）；
+    没发布过时回落到 <data>/macos-releases 下最新的 zip/dmg，方便临时手工丢包。
+
+协议要点（移植自 app/src/main/java/kittoku/osc，Android 端实跑验证过的实现）
+--------------------------------------------------------------------------
+- SSTP 头 4 字节：类型（0x1000 DATA / 0x1001 CONTROL）+ 总长度；DATA 帧后接
+  0xFF03 + PPP 协议号。
+- 控制包 8 字节头：类型、长度、消息类型、属性数量；属性 4 字节头：保留、ID、长度。
+- CALL_CONNECTED 必须是 112 字节：属性值 = 3 字节保留 + 哈希算法 + 32 nonce +
+  32 证书哈希 + 32 CMAC；CMAC 用 HLAK→CMK 两段 HMAC 计算，包内 CMAC 位置先置零。
+- PPP 长度字段 = 4 + 数据长度（从 Code 起算，不含协议号）。
+- 认证：LCP 里按服务器要求选 PAP / CHAP-MSCHAPv2 / EAP-MSCHAPv2；当前线上节点是 PAP，
+  PAP 没有 MSK，SSTP 绑定按协议用全零 HLAK。
+- IPCP：请求 IP 与 DNS，服务器 NAK 后取回分配值；对端请求里的 DNS 选项一律 Reject。
+
+安全与数据
+----------
+- 本地通信令牌 32 字节随机值，界面 0600 保存，内核侧 /Library/Application Support 0600；
+  socket 0666 但每个请求校验令牌。
+- 连接日志写在 /Library/Application Support/QingyouPrivateCloud/connection.log，
+  约 1 MiB 轮转，password/token/authorization 全部脱敏。
+- 统计上报使用随机生成的设备键（同一台机器固定），不采集硬件信息。
+- 客户端不修改系统 VPN 配置、不装第三方网络驱动；只建 utun、加路由、写 DNS 状态。
+
+发布准备（2026-11-09）
+-------------------
+在出包这件事上，能在 Windows 开发机上完成的都已经做完，只剩「用 Xcode 命令行工具编译 Swift」这一步
+必须由 macOS 完成（Swift 编译器与 macOS SDK 无法在 Windows 上运行）。
+
+已完成：
+1. 预编译 macos/dist/engine/qyvpn-engine（通用二进制，arm64 + x86_64），以及两个单架构版本。
+   - 已用 -ldflags 注入版本 1.0.0 与 .private/client.properties 里的客户端令牌。
+   - 结构校验：fat 头 magic=0xCAFEBABE、2 个切片、两个切片均为 64 位 Mach-O MH_EXECUTE，
+     且切片字节与输入完全一致（tools/make-fat.py 回读断言）。
+   - 说明：fat 二进制由 tools/make-fat.py 合并（等价 lipo -create），
+     因为 lipo 只在 macOS 上存在。首次在 Mac 上出包时若对它有疑问，
+     直接跑不带 --prebuilt 的 ./build.sh 用 lipo 重新合并即可。
+2. build.sh 增加 --prebuilt：Mac 上即使没装 Go 也能出包；同时自动产出
+   dist/SHA256SUMS.txt 与 dist/发布说明_v1.0.0.txt。
+3. 应用图标：沿用 Android 端同一张图（app/src/main/res/drawable-nodpi/qingyou_logo.png，
+   AndroidManifest 的 android:icon 指向 qingyou_launcher，前景即此图）。tools/make-icon.py
+   只做 macOS 形状适配（6% 透明边距、22.5% 圆角）并打包成 AppIcon.icns（8 个尺寸，最大 1024），
+   build.sh 会放进 .app 并写 CFBundleIconFile；窗口内的品牌标识读同一个 icns。
+   结构已校验：icns 头长度与文件一致、8 个块均为 PNG、块长度含 8 字节头（此前写错过一次）。
+4. macOS 上出包的命令只有一条：
+       cd macos && ./build.sh --prebuilt
+   产物：dist/清幽私人云.app、dist/清幽私人云_macOS_v1.0.0.zip、SHA256SUMS.txt、发布说明。
+   （改动过 Swift 代码或要换版本号/令牌时，去掉 --prebuilt 并确保本机有 Go。）
+
+当前内核校验值（dist/engine/SHA256SUMS.txt）：
+  8147a1b6a3643ff4f07cdebc50e97ef84a028158dc4b02785e408229362dd21b  qyvpn-engine（14,781,904 字节）
+  e1a03a7a91aeeccac3c5ccf65669d9fe9cf7447e0a7eb1a8d828508267ce7307  qyvpn-engine-arm64（7,095,090 字节）
+  e81f7c149914b23329a0e2652772f41dd57b1e1458b535329c83c1ea8276722c  qyvpn-engine-amd64（7,654,864 字节）
+
+仍未验证（只能在 Mac 上做）：
+- swift build 是否能一次通过（代码从未编译过；预期只需修少量语法/API 差异）。
+- codesign --deep -s - 之后 Gatekeeper 的表现、launchd 安装与内核启动、
+  utun/ifconfig/route/scutil 的真实效果（见本文件前面的「需要在 Mac 上实测的部分」）。
+
+构建包（无 Mac 时的搬运方式）
+--------------------------
+  cd macos && python3 tools/make-bundle.py --version 1.0.0
+  产物 dist/清幽私人云_macOS_v1.0.0_构建包.zip（12,475,595 字节，53 个文件，
+  SHA256 043468d951c582384bfc4d2d659a846ab9486505d31f0916802e688aa0a243fd）
+  内容：全部源码、build.sh、tools/、图标，以及 dist/engine 下三个预编译内核；
+        build.sh 与内核已带 0755 权限（Windows 上打包时按文件名补的权限位）。
+  校验：解包出的 qyvpn-engine 与 dist/engine/qyvpn-engine 逐字节一致；
+        zip testzip 无损坏；fat 头 0xCAFEBABE、2 个切片。
+  Mac 上：解压后双击「出包.command」（等价于 cd macos && ./build.sh --prebuilt），
+  成功后会自动打开 dist 目录。

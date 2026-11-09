@@ -1,0 +1,126 @@
+name: macOS 客户端构建
+
+# 在 GitHub 提供的 macOS 机器上编译 SwiftUI 界面 + Go 内核。
+# 用法：Actions 页面点 Run workflow；推送 macos/ 下的改动也会自动触发。
+#
+# 令牌：仓库 Settings → Secrets and variables → Actions 添加 QYVPN_API_TOKEN。
+# 没设置时会用占位令牌继续构建（只为验证能否编译通过），产物名带 NOT-FOR-RELEASE，
+# 不要拿去发布——客户端会因为凭据无效而拿不到节点。
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "构建架构：arm64 快一倍，universal 同时支持 Intel"
+        type: choice
+        options: [arm64, universal]
+        default: arm64
+  push:
+    branches: [main]
+    paths:
+      - "macos/**"
+      # 导出的公开仓库里内核在 core/，改了内核也要重新验证
+      - "core/**"
+      - "macos/engine/**"
+      - ".github/workflows/macos-build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      QYVPN_VERSION: ${{ vars.QYVPN_VERSION || '1.0.0' }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          # 内核是纯标准库、没有 go.sum，不需要缓存依赖
+          cache: false
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
+          go version
+          xcode-select -p
+
+      - name: 编译（内核 + 界面 + 打包 + 签名）
+        id: build
+        run: |
+          set -o pipefail
+          TOKEN="${{ secrets.QYVPN_API_TOKEN }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="CI-PLACEHOLDER-NOT-FOR-RELEASE"
+            echo "::warning::未设置 QYVPN_API_TOKEN，本次产物不可用于发布"
+            echo "release_ready=0" >> "$GITHUB_OUTPUT"
+            echo "artifact_suffix=-NOT-FOR-RELEASE" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_ready=1" >> "$GITHUB_OUTPUT"
+            echo "artifact_suffix=" >> "$GITHUB_OUTPUT"
+          fi
+          chmod +x macos/build.sh
+          cd macos
+          # 只编 arm64 时省一半机器时间，先验证 Swift 能不能过；要发版再选 universal。
+          ARCH_ARG=""
+          if [ "${{ inputs.arch }}" != "universal" ]; then ARCH_ARG="--arm64"; fi
+          echo "构建参数：$ARCH_ARG"
+          QYVPN_API_TOKEN="$TOKEN" QYVPN_VERSION="$QYVPN_VERSION" ./build.sh $ARCH_ARG 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 产物清单
+        if: always()
+        run: |
+          echo "===== dist ====="
+          ls -la macos/dist 2>/dev/null || echo "（没有产物目录）"
+          echo "===== 应用包内结构 ====="
+          find "macos/dist/清幽私人云.app" -maxdepth 2 -print 2>/dev/null | head -30 || true
+          echo "===== 签名 ====="
+          codesign -dv --verbose=2 "macos/dist/清幽私人云.app" 2>&1 | head -10 || true
+
+      # 编译日志里没有令牌（构建脚本不回显），可以公开，方便在手机/网页上直接看报错
+      - name: 生成编译日志摘要
+        if: always()
+        run: |
+          {
+            echo "## macOS 构建结果：${{ steps.build.outcome }}"
+            echo ""
+            echo '```'
+            grep -E "error:|warning:|错误|失败|✔|==>|Build complete|Compiling|Linking" build.log 2>/dev/null | tail -60 || tail -60 build.log 2>/dev/null || echo "没有日志"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传安装包（需登录 GitHub 才能下载）
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 清幽私人云-macOS-${{ env.QYVPN_VERSION }}-${{ inputs.arch || 'arm64' }}${{ steps.build.outputs.artifact_suffix }}
+          path: |
+            macos/dist/*.zip
+            macos/dist/清幽私人云.app
+          if-no-files-found: error
+          retention-days: 30
+
+      # 公开的只有日志：不动二进制，避免把内嵌令牌的安装包放到公开位置
+      - name: 公开编译日志
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete macos-ci --yes --cleanup-tag 2>/dev/null || true
+          gh release create macos-ci \
+            --title "macOS 构建日志（自动）" \
+            --notes "仅存放编译日志，安装包请在本页上方的 Artifacts 里下载。" 2>/dev/null || true
+          cp build.log macos-build.log 2>/dev/null || echo "没有生成日志" > macos-build.log
+          gh release upload macos-ci macos-build.log --clobber || true

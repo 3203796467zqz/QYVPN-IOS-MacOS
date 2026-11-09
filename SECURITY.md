@@ -18,13 +18,16 @@ iOS 隧道扩展的权限边界问题），请**不要**开公开 Issue，改用
 - SSTP / PPP / MSCHAPv2 协议实现中的缺陷
 - TLS 与证书校验（未校验主机名、允许降级、CA 固定逻辑错误）
 - iOS 隧道扩展的权限边界、App Group 数据暴露
-- 本地凭据存储（Keychain、文件权限）问题
-- 会让流量发往错误目的地的路由/排除路由缺陷
+- macOS 特权组件（`qyvpn-engine`）的权限边界、socket 认证、launchd 安装过程
+- 本地凭据存储（Keychain、文件权限、状态目录权限）问题
+- 会让流量发往错误目的地的路由/排除路由/DNS 缺陷（含 macOS 的 utun 路由与 iOS 的 excludedRoutes）
 
 不属于安全问题的：
 
 - 需要物理接触设备或已越狱的攻击场景
 - App Store / TestFlight 分发与审核问题
+- macOS 未签名/未公证导致 Gatekeeper 拦截（这是预期行为，不是漏洞）
+- macOS 未签名/未公证导致 Gatekeeper 拦截（这是预期行为，不是漏洞）
 - 你自己签发的令牌或账号被滥用
 - 服务端部署问题（本仓库不含服务端）
 

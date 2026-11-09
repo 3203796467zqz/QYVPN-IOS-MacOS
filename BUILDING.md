@@ -1,6 +1,6 @@
 # 构建说明
 
-iOS 客户端需要一个 **客户端访问令牌**（`apiToken`）才能同步节点。这个令牌由服务端
+iOS 与 macOS 客户端都需要一个 **客户端访问令牌**（`apiToken`）才能同步节点。这个令牌由服务端
 管理员签发，只具备「读配置 / 读状态 / 上报统计」权限，不含管理权限。本仓库不提供令牌。
 
 准备方式（任选其一）：
@@ -20,17 +20,20 @@ printf 'apiToken=你的令牌\n' > .private/client.properties
 
 | 工具 | 版本 | 用途 |
 | --- | --- | --- |
-| Xcode | 15 或更新 | 编译 Swift、打包 ipa |
-| Go | 1.26+ | 编译 `core/` 内核（gomobile 对 Go 版本有要求） |
-| gomobile | 最新 | 把 Go 编译成 `Engine.xcframework`（`build.sh` 会自动安装） |
-| XcodeGen | 最新 | 由 `ios/app/project.yml` 生成 Xcode 工程 |
+| Xcode | 15 或更新 | 编译 Swift；iOS 打包 ipa、macOS 打包 .app |
+| Go | 1.26+ | 编译 `core/` 内核（iOS 侧的 gomobile 对 Go 版本有要求） |
+| gomobile | 最新 | 把 Go 编译成 `Engine.xcframework`（`ios/build.sh` 会自动安装） |
+| XcodeGen | 最新 | 由 `ios/app/project.yml` 生成 Xcode 工程（只有 iOS 需要） |
+
+macOS 端不需要 gomobile 与 XcodeGen：它直接把 `core/` 编成命令行可执行文件，
+界面用 Swift Package Manager 编译。
 
 ```bash
 brew install xcodegen
 go install golang.org/x/mobile/cmd/gomobile@latest
 ```
 
-## 二、构建
+## 二、构建 iOS
 
 ```bash
 cd ios
@@ -61,7 +64,26 @@ QYVPN_TEAM=ABCDE12345 QYVPN_VERSION=1.0.0 QYVPN_BUILD=1 ./build.sh
 首次用 Xcode 打开工程的话，先跑一次 `./build.sh --verify` 生成
 `Engine.xcframework`，否则会报找不到符号。直接编译也能过，只是没有令牌连不上后台。
 
-## 三、需要准备什么（Apple 侧）
+## 三、构建 macOS
+
+```bash
+# 通用二进制（Apple Silicon + Intel），产出 .app 与 .zip
+QYVPN_API_TOKEN=你的令牌 ./macos/build.sh
+
+# 只编 Apple Silicon，快一倍
+./macos/build.sh --arm64
+```
+
+产物：`macos/dist/清幽私人云.app` 与同名 `.zip`。
+
+首次打开会提示「无法验证开发者」——这是 ad-hoc 签名（没有 Apple 公证）的正常现象，
+右键 → 打开即可。第一次连接时 App 会要求安装网络组件，输入一次管理员密码，
+它会把内核装到 `/Library/PrivilegedHelperTools/` 并用 launchd 常驻。
+
+**macOS 不需要开发者账号**：它不经过 App Store，走的是自己的下载渠道。
+只有 iOS 因为 NetworkExtension 必须签名才需要付费账号。
+
+## 四、需要准备什么（Apple 侧）
 
 1. Apple Developer Program 账号（个人/公司，$99/年）。
 2. 两个 App ID：`cn.qo8.qyvpn.client` 与 `cn.qo8.qyvpn.client.tunnel`。
@@ -71,7 +93,7 @@ QYVPN_TEAM=ABCDE12345 QYVPN_VERSION=1.0.0 QYVPN_BUILD=1 ./build.sh
 Bundle ID、App Group 若要改，alter 三个地方：`ios/app/project.yml`、
 `ios/app/Sources/Shared/SharedConfig.swift`、开发者后台。
 
-## 四、云端构建
+## 五、云端构建
 
 没有 Mac 也能出包：把仓库设为 Public 后，Actions 里的
 「iOS 客户端构建」会用 GitHub 的 macOS 机器编译。
@@ -82,7 +104,7 @@ Bundle ID、App Group 若要改，alter 三个地方：`ios/app/project.yml`、
 
 > 产出的 ipa 内嵌受限客户端令牌，**只放 Actions Artifacts，不要传到 Releases**。
 
-## 五、常见问题
+## 六、常见问题
 
 **提示「客户端未正确打包（缺少访问令牌）」**：构建时没有提供 `QYVPN_API_TOKEN`，
 Info.plist 里的 `QYVPNClientToken` 是空的。
