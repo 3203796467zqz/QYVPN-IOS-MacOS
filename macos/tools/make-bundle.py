@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SKIP_DIRS = {".build", "__pycache__", ".swiftpm"}
 SKIP_SUFFIXES = {".pyc"}
 # dist 只带预编译内核；其余产物（.app、zip）由 Mac 上重新生成。
-ALLOW_DIST = ("engine/qyvpn-engine",)
+ALLOW_DIST = ("engine/qyvpn-engine", "engine/SHA256SUMS.txt")
 
 
 def is_executable(rel: Path) -> bool:
