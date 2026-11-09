@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,6 +123,15 @@ type Agent struct {
 
 	probeMu   sync.Mutex
 	lastProbe map[string]ProbeResult
+	// probeDNS 缓存节点域名的解析结果。DNS 往往比 TCP 握手慢一个数量级，
+	// 把它算进「延迟」会得到「亚洲节点 800ms」这种假数字。
+	probeDNS map[string]dnsEntry
+}
+
+// dnsEntry 是一次解析结果，10 分钟内复用。
+type dnsEntry struct {
+	ips []string
+	at  time.Time
 }
 
 // ProbeResult 是一次 TCP 443 测速结果。
@@ -150,6 +160,7 @@ func New(apiBase, token string) (*Agent, error) {
 		state:     StateIdle,
 		stage:     "未连接",
 		lastProbe: map[string]ProbeResult{},
+		probeDNS:  map[string]dnsEntry{},
 	}
 	a.ledger = loadLedger(filepath.Join(paths.StateDir(), "ledger.json"))
 	a.settings = loadSettings(paths.SettingsFile())
@@ -224,6 +235,8 @@ func (a *Agent) Refresh(ctx context.Context) error {
 	}
 	a.mu.Unlock()
 	a.logf("节点已同步：%d 台", len(cfg.Nodes))
+	// 后台预热域名解析，避免第一次测速把 DNS 时间算进延迟。
+	go a.warmDNS(cfg.Nodes)
 	return nil
 }
 
@@ -799,6 +812,14 @@ func (a *Agent) Probe(ids []string) map[string]ProbeResult {
 	out := map[string]ProbeResult{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	// 同时最多探 6 台：节点多时一并发起，本地出口的排队时间会被算进结果。
+	sem := make(chan struct{}, 6)
+	a.probeMu.Lock()
+	if a.probeDNS == nil {
+		a.probeDNS = map[string]dnsEntry{}
+	}
+	a.probeMu.Unlock()
+
 	for _, n := range nodes {
 		if !wanted[n.ID] {
 			continue
@@ -815,18 +836,10 @@ func (a *Agent) Probe(ids []string) map[string]ProbeResult {
 		wg.Add(1)
 		go func(node *model.Node) {
 			defer wg.Done()
-			start := time.Now()
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(node.Host, fmt.Sprint(node.Port)), 4*time.Second)
-			res := ProbeResult{At: time.Now()}
-			if err != nil {
-				res.Error = "连接失败"
-				if strings.Contains(err.Error(), "timeout") {
-					res.Error = "超时"
-				}
-			} else {
-				res.MS = time.Since(start).Milliseconds()
-				_ = conn.Close()
-			}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			res := a.probeOne(node)
 			mu.Lock()
 			out[node.ID] = res
 			mu.Unlock()
@@ -837,6 +850,161 @@ func (a *Agent) Probe(ids []string) map[string]ProbeResult {
 	}
 	wg.Wait()
 	return out
+}
+
+// probeOne 只做 TCP 三次握手：不建 TLS、不发 HTTP，握手耗时就是链路往返时间。
+func (a *Agent) probeOne(node *model.Node) ProbeResult {
+	res := ProbeResult{At: time.Now()}
+	addrs := a.probeAddrs(node.Host, node.Port)
+	ms, err := rttWithSample(func() (int64, error) {
+		return dialBest(addrs, 1500*time.Millisecond)
+	})
+	if err != nil {
+		res.Error = "连接失败"
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			res.Error = "超时"
+		}
+		return res
+	}
+	res.MS = ms
+	return res
+}
+
+// rttWithSample 先测一次；很快（≤150ms）就直接用，慢就再测两次取最小值。
+//
+// 为什么要取最小值：SYN 丢一个包时 TCP 会等 1 秒才重传，单次采样就会稳定
+// 显示「1000ms 以上」，而真实 RTT 可能只有 80ms。最小值最接近链路本身。
+func rttWithSample(sample func() (int64, error)) (int64, error) {
+	best, err := sample()
+	if err != nil {
+		return 0, err
+	}
+	if best <= 150 {
+		return best, nil
+	}
+	for i := 0; i < 2; i++ {
+		if ms, e := sample(); e == nil && ms < best {
+			best = ms
+		}
+	}
+	return best, nil
+}
+
+// dialBest 并发探测所有候选地址，返回最快的一次握手耗时。
+//
+// 一个域名常常解析出多个 IP，其中个别不可达（被墙、已下线）。逐个串行试会
+// 把「等待超时」的时间算进延迟；并发探完取最小值，才是链路真实水平。
+func dialBest(addrs []string, timeout time.Duration) (int64, error) {
+	if len(addrs) == 0 {
+		return 0, errors.New("没有可用的节点地址")
+	}
+	type outcome struct {
+		ms  int64
+		err error
+	}
+	results := make(chan outcome, len(addrs))
+	for _, addr := range addrs {
+		go func(target string) {
+			ms, err := tcpOnce(target, timeout)
+			results <- outcome{ms: ms, err: err}
+		}(addr)
+	}
+	best := int64(-1)
+	var lastErr error
+	for range addrs {
+		item := <-results
+		if item.err != nil {
+			lastErr = item.err
+			continue
+		}
+		if best < 0 || item.ms < best {
+			best = item.ms
+		}
+	}
+	if best < 0 {
+		if lastErr == nil {
+			lastErr = errors.New("连接失败")
+		}
+		return 0, lastErr
+	}
+	return best, nil
+}
+
+// tcpOnce 是一次握手的耗时，失败立刻返回，不重试。
+func tcpOnce(addr string, timeout time.Duration) (int64, error) {
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return 0, err
+	}
+	ms := time.Since(start).Milliseconds()
+	_ = conn.Close()
+	if ms < 0 {
+		ms = 0
+	}
+	return ms, nil
+}
+
+// probeAddrs 返回节点所有候选的 ip:port。
+//
+// 域名解析结果缓存 10 分钟：DNS 往往比握手慢一个数量级（实测失效域名要 696ms），
+// 每次都重新解析会让「延迟」变成 DNS 耗时。解析失败时退回原域名，交给 Dial 自己处理。
+func (a *Agent) probeAddrs(host string, port int) []string {
+	portText := strconv.Itoa(port)
+	if net.ParseIP(host) != nil {
+		return []string{net.JoinHostPort(host, portText)}
+	}
+
+	a.probeMu.Lock()
+	if e, ok := a.probeDNS[host]; ok && len(e.ips) > 0 && time.Since(e.at) < 10*time.Minute {
+		ips := append([]string(nil), e.ips...)
+		a.probeMu.Unlock()
+		return hostPorts(ips, portText)
+	}
+	a.probeMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	found, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil || len(found) == 0 {
+		return []string{net.JoinHostPort(host, portText)}
+	}
+	ips := make([]string, 0, len(found))
+	seen := map[string]bool{}
+	for _, item := range found {
+		ip := item.IP.String()
+		if seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		ips = append(ips, ip)
+		if len(ips) == 4 { // 最多探 4 个，够覆盖常见多 A 记录
+			break
+		}
+	}
+	a.probeMu.Lock()
+	a.probeDNS[host] = dnsEntry{ips: ips, at: time.Now()}
+	a.probeMu.Unlock()
+	return hostPorts(ips, portText)
+}
+
+func hostPorts(ips []string, port string) []string {
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		out = append(out, net.JoinHostPort(ip, port))
+	}
+	return out
+}
+
+// warmDNS 提前把节点域名解析好：用户第一次点「测速」时就不必等 DNS。
+func (a *Agent) warmDNS(nodes []*model.Node) {
+	for _, n := range nodes {
+		if n == nil || n.Host == "" {
+			continue
+		}
+		_ = a.probeAddrs(n.Host, n.Port)
+	}
 }
 
 // LogTail 返回最近的日志行。
