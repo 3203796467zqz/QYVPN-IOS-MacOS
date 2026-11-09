@@ -102,6 +102,10 @@ struct EngineStatus: Codable {
 }
 
 /// 账号信息（对应后台 userView）。
+///
+/// 后台对 expire / lastLogin / platform / planName 等字段用了 omitempty，
+/// 未激活账号就可能整键缺失。Swift 合成的 Decodable 在缺失时直接抛 keyNotFound，
+/// 会让「整个 EngineStatus 解码失败」，界面表现为一片空白——所以这里逐个 decodeIfPresent。
 struct UserAccount: Codable {
     var id: String = ""
     var username: String = ""
@@ -118,6 +122,25 @@ struct UserAccount: Codable {
     var note: String = ""
     var planId: String = ""
     var planName: String = ""
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        username = try c.decodeIfPresent(String.self, forKey: .username) ?? ""
+        email = try c.decodeIfPresent(String.self, forKey: .email) ?? ""
+        member = try c.decodeIfPresent(String.self, forKey: .member) ?? ""
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? ""
+        expire = try c.decodeIfPresent(String.self, forKey: .expire) ?? ""
+        active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? false
+        daysLeft = try c.decodeIfPresent(Int.self, forKey: .daysLeft) ?? 0
+        created = try c.decodeIfPresent(String.self, forKey: .created) ?? ""
+        lastLogin = try c.decodeIfPresent(String.self, forKey: .lastLogin) ?? ""
+        platform = try c.decodeIfPresent(String.self, forKey: .platform) ?? ""
+        disabled = try c.decodeIfPresent(Bool.self, forKey: .disabled) ?? false
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
+        planId = try c.decodeIfPresent(String.self, forKey: .planId) ?? ""
+        planName = try c.decodeIfPresent(String.self, forKey: .planName) ?? ""
+    }
 
     /// 「会员 · 剩余 30 天」这类一行摘要。
     var summary: String {
@@ -138,6 +161,13 @@ struct PlanInfo: Codable {
     var id: String = ""
     var name: String = ""
     var nodes: Int = 0
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        nodes = try c.decodeIfPresent(Int.self, forKey: .nodes) ?? 0
+    }
 
     var summary: String {
         name.isEmpty ? "\(nodes) 台节点" : "\(name) · \(nodes) 台节点"
