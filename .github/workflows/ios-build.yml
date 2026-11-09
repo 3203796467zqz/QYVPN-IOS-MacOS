@@ -60,7 +60,9 @@ jobs:
       - name: 准备 Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          # gomobile@latest 的 go.mod 要求很新的 Go（本次是 1.26+），固定小版本会
+          # 在 go install 阶段触发工具链切换并失败。用 stable 跟随 runner 上的最新稳定版。
+          go-version: "stable"
           # 内核是纯标准库、没有任何外部依赖，没有 go.sum，不需要缓存依赖。
           cache: false
 
