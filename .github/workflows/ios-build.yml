@@ -205,6 +205,7 @@ jobs:
       # 失败时把日志关键行打成 GitHub 注解。
       # 用它的原因很实际：Actions 的完整日志要仓库管理员权限才能通过 API 下载，
       # 而注解（annotations）对公开仓库是匿名可读的 —— 这样不登录也能定位问题。
+      # 注意：每个 step 最多 10 条注解，所以末尾日志要拼成一条（%0A 换行）发。
       - name: 失败诊断
         if: failure()
         run: |
@@ -213,11 +214,21 @@ jobs:
             echo "::error::没有生成编译日志，脚本在更早阶段就退出了（检查工具链或路径）"
             exit 0
           fi
-          echo "===== 错误行 ====="
-          grep -nE "error:|error |错误|失败|fatal|not found|No such file|cannot|undefined" "$LOG" \
-            | tail -30 | while IFS= read -r line; do echo "::error::$line"; done
-          echo "===== 日志末尾 ====="
-          tail -30 "$LOG" | while IFS= read -r line; do echo "::error::$line"; done
+          echo "===== 可能是错误行 ====="
+          grep -inE "go: |error|fatal|cannot|denied|failed|失败|错误|not found|no such file" "$LOG" \
+            | tail -6 | while IFS= read -r line; do echo "::error::$line"; done
+
+          echo "===== 日志末尾 45 行（合并成一条注解）====="
+          python3 - "$LOG" <<'PY'
+          import sys
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()[-45:]
+          msg = "\n".join(lines).replace("%", "%25").replace("\r", "")
+          msg = msg.replace("\n", "%0A")
+          print("::error::" + msg[:9000])
+          PY
+
+          echo "===== 末尾原样输出（便于在 UI 里直接看）====="
+          tail -45 "$LOG"
 
       - name: 上传编译日志（失败时）
         if: failure()
