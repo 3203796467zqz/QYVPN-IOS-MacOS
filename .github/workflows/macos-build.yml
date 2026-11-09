@@ -33,7 +33,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-14（Xcode 15）已被 GitHub 逐步下线，job 会直接起不来且没有步骤日志。
+    # 与 iOS 工作流统一用 macos-15（Xcode 16）。
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       QYVPN_VERSION: ${{ vars.QYVPN_VERSION || '1.0.0' }}
@@ -100,6 +102,19 @@ jobs:
             grep -E "error:|warning:|错误|失败|✔|==>|Build complete|Compiling|Linking" build.log 2>/dev/null | tail -60 || tail -60 build.log 2>/dev/null || echo "没有日志"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 失败时把日志末尾打成注解：Actions 完整日志要管理员权限才能通过 API 读取，
+      # 注解对公开仓库匿名可读（每个 step 最多 10 条，所以拼成一条发）。
+      - name: 失败诊断
+        if: failure()
+        run: |
+          [ -f build.log ] || { echo "::error::没有生成 build.log，脚本在更早阶段退出"; exit 0; }
+          python3 - build.log <<'PY2'
+          import sys
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()[-45:]
+          msg = "\n".join(lines).replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print("::error::" + msg[:9000])
+          PY2
 
       - name: 上传安装包（需登录 GitHub 才能下载）
         if: steps.build.outcome == 'success'
