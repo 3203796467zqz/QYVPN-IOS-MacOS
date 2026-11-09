@@ -83,7 +83,7 @@ fi
 # 不落任何一个 .swift 文件，源码里永远看不到它。
 SETTING_TOKEN="QYVPN_CLIENT_TOKEN=$TOKEN"
 
-echo "==> 版本 $VERSION（build $BUILD_NUMBER）"
+echo "==> 版本 ${VERSION}（build ${BUILD_NUMBER}）"
 
 # ------------------------------------------------------------------ Go 内核
 if [ "$SKIP_ENGINE" = "0" ]; then
@@ -108,7 +108,7 @@ if [ "$SKIP_ENGINE" = "0" ]; then
   fi
 
   mkdir -p "$FRAMEWORK_DIR"
-  echo "==> 编译 Go 内核（target=$GOMOBILE_TARGET）"
+  echo "==> 编译 Go 内核（target=${GOMOBILE_TARGET}）"
   ( cd "$ENGINE_DIR" && \
     gomobile bind -target="$GOMOBILE_TARGET" -ldflags "$LDFLAGS" \
       -o "$FRAMEWORK_DIR/Engine.xcframework" ./mobile )
@@ -160,7 +160,7 @@ mkdir -p "$OUT"
 AUTH_FLAGS=""
 if [ -n "${QYVPN_API_KEY_PATH:-}" ] && [ -n "${QYVPN_API_KEY_ID:-}" ] && [ -n "${QYVPN_API_ISSUER:-}" ]; then
   AUTH_FLAGS="-allowProvisioningUpdates -authenticationKeyPath $QYVPN_API_KEY_PATH -authenticationKeyID $QYVPN_API_KEY_ID -authenticationKeyIssuerID $QYVPN_API_ISSUER"
-  echo "==> 使用 App Store Connect API Key 自动管理描述文件（key $QYVPN_API_KEY_ID）"
+  echo "==> 使用 App Store Connect API Key 自动管理描述文件（key ${QYVPN_API_KEY_ID}）"
 fi
 
 echo "==> 归档"

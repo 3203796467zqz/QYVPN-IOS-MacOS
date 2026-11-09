@@ -61,10 +61,8 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.24"
-          # 两个路径只会存在一个：私有仓库是 macos/engine，导出的公开仓库是 core/
-          cache-dependency-path: |
-            macos/engine/go.sum
-            core/go.sum
+          # 内核是纯标准库、没有任何外部依赖，没有 go.sum，不需要缓存依赖。
+          cache: false
 
       - name: 环境信息
         run: |
