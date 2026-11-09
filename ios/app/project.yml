@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# project.yml：iOS 工程定义（XcodeGen）。
+#
+# 为什么用 XcodeGen 而不是直接提交 .xcodeproj：工程文件是二进制式的 plist，
+# 每次改配置都会产生大量无意义 diff，且多人协作容易冲突。这里用一份几十行的
+# YAML 描述两个 target（主 App + 隧道扩展），`xcodegen generate` 随时重建工程。
+#
+# 用法：
+#   brew install xcodegen
+#   cd ios && ./build.sh            # 会自动生成工程、编译内核、出 ipa
+#
+# 需要手工在 Apple 开发者后台准备：
+#   1. App ID：cn.qo8.qyvpn.client 与 cn.qo8.qyvpn.client.tunnel
+#   2. 两个 App ID 都开启 App Groups，并创建 group.cn.qo8.qyvpn
+#   3. 扩展的 App ID 开启 Network Extensions（Packet Tunnel）
+
+name: QYVPN
+
+options:
+  bundleIdPrefix: cn.qo8.qyvpn
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_ENABLE_MODULES: YES
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  # 主 App：登录、节点列表、状态展示。不链接 Go 内核，体积小、启动快。
+  QYVPN:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/App
+      - path: Sources/Shared
+      - path: Resources/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.qo8.qyvpn.client
+        PRODUCT_NAME: QYVPN
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        # 客户端访问令牌由 build.sh 以 KEY=VALUE 形式覆盖；这里给空默认值，
+        # 直接用 Xcode 编译也能过，只是拿不到节点（请求会 401）。
+        # 走 Info.plist 而不是写进 .swift 文件，是为了让令牌永远不会出现在源码里。
+        QYVPN_CLIENT_TOKEN: ""
+    info:
+      path: Resources/Info-App.plist
+      properties:
+        CFBundleDisplayName: 清幽加速器
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # 构建时把 QYVPN_CLIENT_TOKEN 展开到这里，App 运行时从 Info.plist 读。
+        QYVPNClientToken: $(QYVPN_CLIENT_TOKEN)
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # 只用了 HTTPS 系统加密，不涉及自定义加密算法，属于豁免项。
+        ITSAppUsesNonExemptEncryption: false
+        LSApplicationCategoryType: public.app-category.utilities
+    entitlements:
+      path: Resources/App.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.cn.qo8.qyvpn
+    dependencies:
+      - target: QYVPNTunnel
+        embed: true
+
+  # 隧道扩展：链接 Go 内核（Engine.xcframework），负责真正的 SSTP 连接与搬包。
+  QYVPNTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Sources/Tunnel
+      - path: Sources/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.qo8.qyvpn.client.tunnel
+        PRODUCT_NAME: QYVPNTunnel
+        SKIP_INSTALL: YES
+        # 扩展进程常驻内存约 50 MB 上限，开优化减小 Go 运行时占用。
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+    info:
+      path: Resources/Info-Tunnel.plist
+      properties:
+        CFBundleDisplayName: 清幽加速器隧道
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    entitlements:
+      path: Resources/Tunnel.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.cn.qo8.qyvpn
+        com.apple.developer.networking.networkextension:
+          - packet-tunnel-provider
+    dependencies:
+      # 由 build.sh 用 gomobile bind 生成，仓库里不提交二进制。
+      - framework: Frameworks/Engine.xcframework
+        embed: false
+        link: true

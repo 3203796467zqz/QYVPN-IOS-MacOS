@@ -1,0 +1,203 @@
+name: iOS 客户端构建
+
+# 在 GitHub 提供的 macOS 机器上出 iOS 包 —— 不需要自己的 Mac。
+#
+# 两种模式，自动切换：
+#   1. 没配签名 secrets  → 只做「编译验证」（不签名、不需要开发者账号），
+#      用来确认 Swift + Go 框架能不能编过；红了就是代码问题，绿了再谈发版。
+#   2. 配齐签名 secrets  → 正式 archive + 导出 ipa，可选直接上传 TestFlight。
+#
+# 需要的 Secrets（Settings → Secrets and variables → Actions）：
+#   QYVPN_TEAM_ID          开发者团队 ID（Member Center 右上角，10 位）
+#   QYVPN_BUILD_CERT_P12   发布证书 .p12 的 base64
+#   QYVPN_CERT_PASSWORD    .p12 的导出密码
+#   APPSTORE_KEY_ID        App Store Connect API Key 的 Key ID
+#   APPSTORE_ISSUER_ID     同上，Issuer ID
+#   APPSTORE_KEY_P8        AuthKey_xxx.p8 的内容（base64）
+#   QYVPN_API_TOKEN        后台客户端访问令牌（不给则产物不能用于发布）
+#
+# 版本号：QYVPN_BUILD 用 run_number 自动递增，满足「每次上传必须更大」的要求。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "构建完成后上传到 TestFlight（需要已配好签名 secrets）"
+        type: boolean
+        default: false
+      version:
+        description: "版本号，留空则用仓库变量 QYVPN_VERSION"
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      # 私有仓库里内核在 macos/engine，只公开 iOS 的仓库里在 core/
+      - "macos/engine/**"
+      - "core/**"
+      - ".github/workflows/ios-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      QYVPN_VERSION: ${{ inputs.version || vars.QYVPN_VERSION || '1.0.0' }}
+      QYVPN_BUILD: ${{ github.run_number }}
+      QYVPN_TEAM: ${{ secrets.QYVPN_TEAM_ID }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          # 两个路径只会存在一个：私有仓库是 macos/engine，导出的公开仓库是 core/
+          cache-dependency-path: |
+            macos/engine/go.sum
+            core/go.sum
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          go version
+          xcode-select -p
+
+      - name: 安装 xcodegen
+        run: brew install xcodegen
+
+      # 签名材料齐不齐决定走「编译验证」还是「正式出包」。
+      # 注意：这里只看是否为空，不打印任何内容。
+      - name: 检查签名材料
+        id: signing
+        env:
+          CERT: ${{ secrets.QYVPN_BUILD_CERT_P12 }}
+          CERT_PASS: ${{ secrets.QYVPN_CERT_PASSWORD }}
+          TEAM: ${{ secrets.QYVPN_TEAM_ID }}
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER: ${{ secrets.APPSTORE_ISSUER_ID }}
+          KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+        run: |
+          if [ -n "$CERT" ] && [ -n "$CERT_PASS" ] && [ -n "$TEAM" ] \
+             && [ -n "$KEY_ID" ] && [ -n "$ISSUER" ] && [ -n "$KEY_P8" ]; then
+            echo "ready=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::签名材料齐全，本次将产出可上传 TestFlight 的 ipa"
+          else
+            echo "ready=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::签名材料不完整，本次只做编译验证（不会产出可安装的包）"
+          fi
+
+      - name: 导入签名证书与 API Key
+        if: steps.signing.outputs.ready == '1'
+        env:
+          CERT: ${{ secrets.QYVPN_BUILD_CERT_P12 }}
+          CERT_PASS: ${{ secrets.QYVPN_CERT_PASSWORD }}
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          KEY_P8: ${{ secrets.APPSTORE_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASS" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # 不加这一步，codesign 会在无交互环境下报 "User interaction is not allowed"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # altool / xcodebuild 默认从这个目录找 App Store Connect 密钥
+          mkdir -p "$HOME/private_keys"
+          echo "$KEY_P8" | base64 --decode > "$HOME/private_keys/AuthKey_${KEY_ID}.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_${KEY_ID}.p8"
+          echo "证书与密钥已就绪"
+
+      - name: 编译验证（不签名，不需要开发者账号）
+        if: steps.signing.outputs.ready != '1'
+        run: |
+          set -o pipefail
+          chmod +x ios/build.sh
+          cd ios
+          ./build.sh --verify 2>&1 | tee "$GITHUB_WORKSPACE/ios-build.log"
+
+      - name: 正式出包
+        if: steps.signing.outputs.ready == '1'
+        env:
+          QYVPN_API_TOKEN: ${{ secrets.QYVPN_API_TOKEN }}
+          QYVPN_API_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          QYVPN_API_ISSUER: ${{ secrets.APPSTORE_ISSUER_ID }}
+        run: |
+          set -o pipefail
+          # build.sh 通过这三个变量让 xcodebuild 自己去后台同步描述文件；
+          # 路径里有 $HOME，只能在 run 里拼，不能写在 env 里。
+          export QYVPN_API_KEY_PATH="$HOME/private_keys/AuthKey_${QYVPN_API_KEY_ID}.p8"
+          chmod +x ios/build.sh
+          cd ios
+          ./build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ios-build.log"
+
+      - name: 产物清单
+        if: always()
+        run: |
+          echo "===== build ====="
+          ls -la ios/build 2>/dev/null || echo "（没有产物目录）"
+          echo "===== ipa ====="
+          find ios/build/export -name '*.ipa' -exec ls -lh {} \; 2>/dev/null || echo "（没有 ipa）"
+
+      # ipa 内嵌了受限客户端令牌，只放 Artifacts（需登录仓库才能下载），
+      # 绝对不要传到 Releases —— 与 macOS 工作流保持同一原则。
+      - name: 上传 ipa（需登录 GitHub 才能下载）
+        if: steps.signing.outputs.ready == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: QYVPN-iOS-${{ env.QYVPN_VERSION }}-${{ env.QYVPN_BUILD }}
+          path: ios/build/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传 TestFlight
+        if: steps.signing.outputs.ready == '1' && inputs.upload
+        env:
+          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          ISSUER: ${{ secrets.APPSTORE_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          IPA="$(find ios/build/export -name '*.ipa' | head -1)"
+          [ -n "$IPA" ] || { echo "没有找到 ipa"; exit 1; }
+          echo "上传 $IPA"
+          # altool 虽被标记为旧工具，但仍是当前 CI 里最省事的上传方式：
+          # 密钥放在 ~/private_keys 下即可，无需 Apple ID 交互登录。
+          xcrun altool --upload-app -f "$IPA" -t ios \
+            --apiKey "$KEY_ID" --apiIssuer "$ISSUER"
+          echo "::notice::已提交 App Store Connect，约 10~30 分钟后可在 TestFlight 看到构建"
+
+      - name: 生成构建摘要
+        if: always()
+        run: |
+          {
+            echo "## iOS 构建：${{ job.status }}"
+            echo ""
+            echo "- 版本：${{ env.QYVPN_VERSION }}（build ${{ env.QYVPN_BUILD }}）"
+            echo "- 模式：${{ steps.signing.outputs.ready == '1' && '正式出包' || '仅编译验证（未配置签名）' }}"
+            echo "- 上传 TestFlight：${{ inputs.upload && steps.signing.outputs.ready == '1' && '是' || '否' }}"
+            echo ""
+            echo '```'
+            grep -E "error:|warning:|错误|失败|==>|BUILD SUCCEEDED|BUILD FAILED|构建完成" ios-build.log 2>/dev/null | tail -50 \
+              || echo "本次没有产生编译日志"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

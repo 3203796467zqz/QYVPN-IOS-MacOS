@@ -1,0 +1,14 @@
+# 构建产物
+ios/build/
+ios/app/Frameworks/
+ios/app/QYVPN.xcodeproj/
+*.ipa
+*.xcarchive
+DerivedData/
+xcuserdata/
+
+# 本机凭据：客户端令牌绝不入库
+.private/
+
+# 系统垃圾
+.DS_Store
