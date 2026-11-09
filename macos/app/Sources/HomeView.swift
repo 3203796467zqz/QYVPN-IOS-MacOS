@@ -14,21 +14,28 @@ struct HomeView: View {
                 if !state.engineReady {
                     InstallCard(working: state.working) { state.installHelper() }
                 }
-                nodeCard
-                powerSection
-                HStack(spacing: 12) {
-                    RateColumn(title: "下载速率", value: Format.rate(state.status.rxRate), systemImage: "arrow.down")
-                    RateColumn(title: "上传速率", value: Format.rate(state.status.txRate), systemImage: "arrow.up")
+                if state.status.needsLogin {
+                    // 后台按账号套餐下发节点：没登录时列表一定是空的，
+                    // 这里直接给登录表单，而不是让用户看着「暂无节点」猜。
+                    LoginForm()
+                } else {
+                    AccountStrip()
+                    nodeCard
+                    powerSection
+                    HStack(spacing: 12) {
+                        RateColumn(title: "下载速率", value: Format.rate(state.status.rxRate), systemImage: "arrow.down")
+                        RateColumn(title: "上传速率", value: Format.rate(state.status.txRate), systemImage: "arrow.up")
+                    }
+                    TrafficCard(
+                        used: state.status.monthUsed > 0 ? state.status.monthUsed : (usage?.usedBytes ?? 0),
+                        limit: state.status.monthLimit > 0 ? state.status.monthLimit : (usage?.limitBytes ?? 0),
+                        upload: usage?.uploadBytes ?? 0,
+                        download: usage?.downloadBytes ?? 0,
+                        load: node?.loadLabel ?? "统计未接入",
+                        onlinePeople: usage?.online ?? 0,
+                        configured: usage?.configured ?? false
+                    )
                 }
-                TrafficCard(
-                    used: state.status.monthUsed > 0 ? state.status.monthUsed : (usage?.usedBytes ?? 0),
-                    limit: state.status.monthLimit > 0 ? state.status.monthLimit : (usage?.limitBytes ?? 0),
-                    upload: usage?.uploadBytes ?? 0,
-                    download: usage?.downloadBytes ?? 0,
-                    load: node?.loadLabel ?? "统计未接入",
-                    onlinePeople: usage?.online ?? 0,
-                    configured: usage?.configured ?? false
-                )
                 footer
             }
             .padding(20)

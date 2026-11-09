@@ -153,3 +153,39 @@
         zip testzip 无损坏；fat 头 0xCAFEBABE、2 个切片。
   Mac 上：解压后双击「出包.command」（等价于 cd macos && ./build.sh --prebuilt），
   成功后会自动打开 dist 目录。
+
+账号体系接入（2026-11-09 晚）
+---------------------------
+背景：线上后台已升级到 1.9.1，节点改为按「用户套餐」下发。未登录请求 /api/app/config
+返回 needLogin=true 与空节点列表，所以 macOS 客户端在此之前「装得上但打开是空的」。
+
+接口契约（与安卓 UserSession.java、Windows CloudClient.cs、引擎 mobile 包一致）：
+  POST /api/app/user/register {username,password,email,platform} → {token,user}
+  POST /api/app/user/login    {username,password,platform}       → {token,user}
+  POST /api/app/user/logout                                     → {ok}
+  GET  /api/app/user/me                                         → {user}
+  POST /api/app/user/redeem   {code}                            → {user,days,expire}
+  鉴权两层：Authorization: Bearer <内置客户端令牌> + X-User-Token: <登录令牌>
+
+内核（engine）：
+  · paths.UserTokenFile()：/Library/Application Support/QingyouPrivateCloud/user.token（0600）
+  · agent.New 启动时读回令牌，SystemStatus 增加 needLogin / loggedIn / noNodes / account / plan
+  · agent.Login / Register / Redeem / Logout；登录、兑换成功后自动 Refresh 同步节点
+  · cloud.Register / cloud.Redeem；并加 userMessage()：登录类错误只透出后台中文提示，
+    但保留 BackendError 错误链，NeedLogin 仍能按 HTTP 401 判定令牌失效
+  · ipc 新增 login / register / redeem / logout 四个指令
+界面（app）：
+  · 新增 Sources/AccountView.swift：LoginForm（登录/注册）、AccountView（账号信息 +
+    卡密续期 + 退出）、AccountStrip（首页账号条）
+  · 首页未登录时直接内嵌登录表单，不再让用户对着「暂无节点」猜
+  · 节点页空状态按 needLogin / noNodes 给不同文案；侧栏新增「我的账号」
+
+验证：
+  · gofmt / go vet 干净，go test ./... 全绿
+  · 新增单测：注册参数与登录态、卡密规范化与后台提示透出、令牌落盘 0600、重启恢复登录态
+  · 真实后台联调（-tags live）：匿名同步 needLogin=true 且 0 节点；
+    错误口令返回「用户名或密码不正确」；登录失败不留令牌
+  · 顺手修：两个连真实节点的联调用例原来自动跑会 panic，已加 //go:build live
+
+仍未验证：Swift 首次编译（本机无工具链）。AccountView 用了 macOS 13 可用的 API，
+去掉了 disableAutocorrection 等跨平台差异较大的修饰符。

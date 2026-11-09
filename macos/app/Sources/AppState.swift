@@ -285,6 +285,109 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - 账号
+
+    var account: UserAccount? { status.account }
+    var plan: PlanInfo? { status.plan }
+    var needsLogin: Bool { status.needsLogin }
+
+    /// 登录成功后内核会带回新的状态与节点列表，直接套用，省一次往返。
+    private func applyAccount(_ response: EngineResponse) {
+        if let st = response.status { status = st }
+        if let list = response.nodes { nodes = list }
+    }
+
+    func login(username: String, password: String) {
+        guard let client else { return }
+        let name = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !password.isEmpty else {
+            show("请输入用户名和密码", .error)
+            return
+        }
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                let response = try await blocking {
+                    try client.call("login", ["username": name, "password": password])
+                }
+                applyAccount(response)
+                if nodes.isEmpty { refreshNodes(quiet: true) }
+                show("已登录：\(name)", .success)
+            } catch {
+                show(error.localizedDescription, .error)
+            }
+        }
+    }
+
+    func register(username: String, password: String, email: String) {
+        guard let client else { return }
+        let name = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !password.isEmpty else {
+            show("请输入用户名和密码", .error)
+            return
+        }
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                let response = try await blocking {
+                    try client.call("register", [
+                        "username": name,
+                        "password": password,
+                        "email": email.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ])
+                }
+                applyAccount(response)
+                if nodes.isEmpty { refreshNodes(quiet: true) }
+                show("注册成功，已登录", .success)
+            } catch {
+                show(error.localizedDescription, .error)
+            }
+        }
+    }
+
+    func redeem(code: String) {
+        guard let client else { return }
+        let value = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            show("请输入卡密", .error)
+            return
+        }
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                let response = try await blocking { try client.call("redeem", ["code": value]) }
+                applyAccount(response)
+                if nodes.isEmpty { refreshNodes(quiet: true) }
+                if let days = response.days, days > 0 {
+                    show("兑换成功，已增加 \(days) 天", .success)
+                } else {
+                    show("兑换成功", .success)
+                }
+            } catch {
+                show(error.localizedDescription, .error)
+            }
+        }
+    }
+
+    func logout() {
+        guard let client else { return }
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                let response = try await blocking { try client.call("logout") }
+                nodes = []
+                status = response.status ?? EngineStatus()
+                show("已退出登录", .success)
+            } catch {
+                show(error.localizedDescription, .error)
+            }
+        }
+    }
+
     // MARK: - 提示
 
     func show(_ text: String, _ kind: Banner.Kind) {

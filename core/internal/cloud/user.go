@@ -53,7 +53,7 @@ func (c *Client) Login(ctx context.Context, username, password, platform string)
 		"platform": platform,
 	}, 64<<10)
 	if err != nil {
-		return nil, err
+		return nil, userMessage(err)
 	}
 	var reply LoginReply
 	if err := json.Unmarshal(data, &reply); err != nil {
@@ -63,6 +63,60 @@ func (c *Client) Login(ctx context.Context, username, password, platform string)
 		return nil, errors.New("登录响应缺少用户令牌")
 	}
 	c.SetUserToken(reply.Token)
+	return &reply, nil
+}
+
+// Register 注册新账号。用户名可用、口令强度、邮箱格式都由后台校验，
+// 失败时返回的错误文本可直接展示给用户（后台给的是中文提示）。
+func (c *Client) Register(ctx context.Context, username, password, email, platform string) (*LoginReply, error) {
+	username = strings.TrimSpace(username)
+	if username == "" || password == "" {
+		return nil, errors.New("请输入用户名和密码")
+	}
+	data, err := c.do(ctx, http.MethodPost, "/api/app/user/register", map[string]string{
+		"username": username,
+		"password": password,
+		"email":    strings.TrimSpace(email),
+		"platform": platform,
+	}, 64<<10)
+	if err != nil {
+		return nil, userMessage(err)
+	}
+	var reply LoginReply
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return nil, fmt.Errorf("注册响应格式不正确：%w", err)
+	}
+	if len(reply.Token) < 16 {
+		return nil, errors.New("注册成功但响应缺少用户令牌，请直接登录")
+	}
+	c.SetUserToken(reply.Token)
+	return &reply, nil
+}
+
+// RedeemReply 是卡密兑换的结果：兑换后的用户视图 + 本次增加的时长与到期时间。
+type RedeemReply struct {
+	User   json.RawMessage `json:"user"`
+	Days   int             `json:"days"`
+	Expire string          `json:"expire"`
+}
+
+// Redeem 用卡密给当前账号续期。必须已登录（后台按 X-User-Token 识别账号），
+// 卡密无效、已使用、被停用等情况的提示同样来自后台。
+func (c *Client) Redeem(ctx context.Context, code string) (*RedeemReply, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if code == "" {
+		return nil, errors.New("请输入卡密")
+	}
+	data, err := c.do(ctx, http.MethodPost, "/api/app/user/redeem", map[string]string{
+		"code": code,
+	}, 64<<10)
+	if err != nil {
+		return nil, userMessage(err)
+	}
+	var reply RedeemReply
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return nil, fmt.Errorf("兑换响应格式不正确：%w", err)
+	}
 	return &reply, nil
 }
 
@@ -95,6 +149,31 @@ func (c *Client) Me(ctx context.Context) (json.RawMessage, error) {
 	}
 	return reply.User, nil
 }
+
+// userMessage 把后台的业务提示原样交给界面。
+//
+// BackendError 的 Error() 形如「后台请求失败（HTTP 401）：用户名或密码不正确」，
+// 登录/注册/兑换这类接口的提示本身就是给用户看的，套上 HTTP 状态码只会让人困惑。
+func userMessage(err error) error {
+	var be *BackendError
+	if errors.As(err, &be) {
+		if body := strings.TrimSpace(be.Body); body != "" {
+			// 保留底层 BackendError：NeedLogin 还要靠 HTTP 状态码判断「令牌失效」，
+			// 只换掉展示文案，不破坏错误链。
+			return &userFacingError{msg: body, err: be}
+		}
+	}
+	return err
+}
+
+// userFacingError 用后台的中文提示作为展示文案，同时把原始错误挂在链上。
+type userFacingError struct {
+	msg string
+	err error
+}
+
+func (e *userFacingError) Error() string { return e.msg }
+func (e *userFacingError) Unwrap() error { return e.err }
 
 // ErrNeedLogin 表示需要用户登录（未登录、令牌过期或被停用）。
 var ErrNeedLogin = errors.New("请先登录账号")

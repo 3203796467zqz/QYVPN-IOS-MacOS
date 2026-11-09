@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+//go:build live
+
+// 这两个用例会连真实节点，默认不跑：go test -tags live ./internal/session/
 package session
 
 import (

@@ -146,3 +146,82 @@ func TestMeWithoutTokenParsesEmptyUser(t *testing.T) {
 		t.Fatalf("err = %v，期望 ErrNeedLogin", err)
 	}
 }
+
+func TestRegisterSendsEmailAndStoresToken(t *testing.T) {
+	var body map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/app/user/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("解析注册请求体：%v", err)
+		}
+		_, _ = w.Write([]byte(`{"token":"abcdef0123456789abcd","user":{"username":"bob"}}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	if _, err := c.Register(context.Background(), " bob ", "pass1234", "bob@example.com", "macos"); err != nil {
+		t.Fatalf("注册失败：%v", err)
+	}
+	if body["username"] != "bob" {
+		t.Fatalf("用户名未去空格：%q", body["username"])
+	}
+	if body["platform"] != "macos" || body["email"] != "bob@example.com" {
+		t.Fatalf("注册参数不对：%+v", body)
+	}
+	if c.UserToken() != "abcdef0123456789abcd" {
+		t.Fatalf("登录态未保存：%q", c.UserToken())
+	}
+}
+
+func TestRedeemNormalizesCodeAndKeepsUserToken(t *testing.T) {
+	var (
+		body map[string]string
+		seen string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/app/user/redeem" {
+			http.NotFound(w, r)
+			return
+		}
+		seen = r.Header.Get("X-User-Token")
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("解析兑换请求体：%v", err)
+		}
+		_, _ = w.Write([]byte(`{"user":{"username":"alice","daysLeft":60},"days":30,"expire":"2027-01-08"}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	c.SetUserToken("user-token-value")
+	reply, err := c.Redeem(context.Background(), "  abcd1234ef567890 ")
+	if err != nil {
+		t.Fatalf("兑换失败：%v", err)
+	}
+	if body["code"] != "ABCD1234EF567890" {
+		t.Fatalf("卡密未规范化为大写去空格：%q", body["code"])
+	}
+	if seen != "user-token-value" {
+		t.Fatalf("未带用户令牌：%q", seen)
+	}
+	if reply.Days != 30 || reply.Expire != "2027-01-08" {
+		t.Fatalf("兑换结果 = %+v", reply)
+	}
+}
+
+func TestRedeemSurfacesBackendMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"该卡密已被使用"}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv)
+	c.SetUserToken("user-token-value")
+	_, err := c.Redeem(context.Background(), "ABCD1234EF567890")
+	if err == nil || !strings.Contains(err.Error(), "该卡密已被使用") {
+		t.Fatalf("错误信息未透出：%v", err)
+	}
+}

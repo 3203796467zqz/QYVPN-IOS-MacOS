@@ -31,6 +31,12 @@ type Request struct {
 	NodeIDs  []string        `json:"nodeIds,omitempty"`
 	Settings *agent.Settings `json:"settings,omitempty"`
 	Lines    int             `json:"lines,omitempty"`
+
+	// 账号相关（login / register / redeem）。
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Email    string `json:"email,omitempty"`
+	Code     string `json:"code,omitempty"`
 }
 
 // Response 是调用结果。
@@ -45,6 +51,10 @@ type Response struct {
 	Log      []string                     `json:"log,omitempty"`
 	Update   *agent.UpdateInfo            `json:"update,omitempty"`
 	Path     string                       `json:"path,omitempty"`
+
+	// 卡密兑换结果（redeem 命令）。
+	Days   int    `json:"days,omitempty"`
+	Expire string `json:"expire,omitempty"`
 }
 
 // Server 是特权组件侧的监听器。
@@ -180,6 +190,51 @@ func (s *Server) dispatch(req Request) Response {
 			return Response{OK: false, Error: err.Error(), Version: ver}
 		}
 		return base()
+	case "login":
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		if err := s.agent.Login(ctx, req.Username, req.Password); err != nil {
+			return Response{OK: false, Error: err.Error(), Version: ver}
+		}
+		r := base()
+		st := s.agent.Status()
+		r.Status = &st
+		r.Nodes = s.agent.Nodes()
+		return r
+	case "register":
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		if err := s.agent.Register(ctx, req.Username, req.Password, req.Email); err != nil {
+			return Response{OK: false, Error: err.Error(), Version: ver}
+		}
+		r := base()
+		st := s.agent.Status()
+		r.Status = &st
+		r.Nodes = s.agent.Nodes()
+		return r
+	case "redeem":
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		reply, err := s.agent.Redeem(ctx, req.Code)
+		if err != nil {
+			return Response{OK: false, Error: err.Error(), Version: ver}
+		}
+		r := base()
+		st := s.agent.Status()
+		r.Status = &st
+		r.Nodes = s.agent.Nodes()
+		r.Days = reply.Days
+		r.Expire = reply.Expire
+		return r
+	case "logout":
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		s.agent.Logout(ctx)
+		r := base()
+		st := s.agent.Status()
+		r.Status = &st
+		r.Nodes = []agent.NodeView{}
+		return r
 	case "disconnect":
 		s.agent.Disconnect()
 		return base()

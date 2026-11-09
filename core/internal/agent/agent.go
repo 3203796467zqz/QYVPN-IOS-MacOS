@@ -59,6 +59,14 @@ type Status struct {
 	DNS        string `json:"dns"`
 	Error      string `json:"error"`
 	Version    string `json:"version"`
+
+	// 账号态。后台 1.9 起节点按用户套餐下发：未登录时 nodes 为空，
+	// 界面必须区分「要登录」和「没有节点」，否则用户只会看到一片空白。
+	NeedLogin bool            `json:"needLogin"`
+	LoggedIn  bool            `json:"loggedIn"`
+	NoNodes   bool            `json:"noNodes"`
+	Account   json.RawMessage `json:"account,omitempty"`
+	Plan      json.RawMessage `json:"plan,omitempty"`
 }
 
 // NodeView 是下发给界面的节点信息（不含密码）。
@@ -145,6 +153,10 @@ func New(apiBase, token string) (*Agent, error) {
 	}
 	a.ledger = loadLedger(filepath.Join(paths.StateDir(), "ledger.json"))
 	a.settings = loadSettings(paths.SettingsFile())
+	// 上次登录的用户令牌：读回来直接带上，重建内核后不用重新登录。
+	if token := loadUserToken(); token != "" {
+		client.SetUserToken(token)
+	}
 	a.logf("客户端启动，后台 %s，版本 %s", client.Base(), cloud.Version)
 	return a, nil
 }
@@ -213,6 +225,96 @@ func (a *Agent) Refresh(ctx context.Context) error {
 	a.mu.Unlock()
 	a.logf("节点已同步：%d 台", len(cfg.Nodes))
 	return nil
+}
+
+// ---- 账号 ----
+
+// loadUserToken 读回上次登录保存的用户令牌；读不到或长度异常都当作未登录。
+func loadUserToken() string {
+	data, err := os.ReadFile(paths.UserTokenFile())
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(string(data))
+	if len(token) < 16 {
+		return ""
+	}
+	return token
+}
+
+// saveUserToken 把登录态落盘（0600）。失败不致命：本次仍可用，只是重启内核后要重新登录。
+func saveUserToken(token string) error {
+	if token == "" {
+		return clearUserToken()
+	}
+	if err := os.WriteFile(paths.UserTokenFile(), []byte(token), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(paths.UserTokenFile(), 0o600)
+}
+
+func clearUserToken() error {
+	if err := os.Remove(paths.UserTokenFile()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// Login 用用户名口令登录，成功后立刻同步一次节点。
+// platform 固定传 macos，后台据此统计各端活跃情况。
+func (a *Agent) Login(ctx context.Context, username, password string) error {
+	reply, err := a.client.Login(ctx, username, password, "macos")
+	if err != nil {
+		a.logf("登录失败：%v", err)
+		return err
+	}
+	if err := saveUserToken(reply.Token); err != nil {
+		a.logf("登录态保存失败（本次仍可用）：%v", err)
+	}
+	a.logf("已登录：%s", username)
+	return a.Refresh(ctx)
+}
+
+// Register 注册新账号并直接登录。参数校验与错误提示都由后台给出。
+func (a *Agent) Register(ctx context.Context, username, password, email string) error {
+	reply, err := a.client.Register(ctx, username, password, email, "macos")
+	if err != nil {
+		a.logf("注册失败：%v", err)
+		return err
+	}
+	if err := saveUserToken(reply.Token); err != nil {
+		a.logf("登录态保存失败（本次仍可用）：%v", err)
+	}
+	a.logf("注册成功并已登录：%s", username)
+	return a.Refresh(ctx)
+}
+
+// Redeem 用卡密给当前账号续期；兑换成功后重新同步节点（套餐变化会带来新的节点与额度）。
+func (a *Agent) Redeem(ctx context.Context, code string) (*cloud.RedeemReply, error) {
+	reply, err := a.client.Redeem(ctx, code)
+	if err != nil {
+		a.logf("卡密兑换失败：%v", err)
+		return nil, err
+	}
+	a.logf("卡密兑换成功：增加 %d 天，到期 %s", reply.Days, reply.Expire)
+	if err := a.Refresh(ctx); err != nil {
+		a.logf("兑换后同步节点失败：%v", err)
+	}
+	return reply, nil
+}
+
+// Logout 退出登录：先断开隧道，再吊销后台令牌、清除本地令牌与节点缓存。
+func (a *Agent) Logout(ctx context.Context) {
+	a.Disconnect()
+	_ = a.client.Logout(ctx)
+	if err := clearUserToken(); err != nil {
+		a.logf("清除登录态失败：%v", err)
+	}
+	a.mu.Lock()
+	a.cfg = nil
+	a.nodes = nil
+	a.mu.Unlock()
+	a.logf("已退出登录")
 }
 
 // AccountJSON 返回后台随配置下发的用户信息（账号、会员到期、套餐节点数）。
@@ -315,6 +417,16 @@ func (a *Agent) Status() Status {
 		if n.ID == a.nodeID {
 			st.NodeName = n.Name
 		}
+	}
+	st.LoggedIn = a.client.UserToken() != ""
+	if a.cfg != nil {
+		// NeedLogin 以后台的说法为准：本地有令牌但已失效时，后台也会给 true。
+		st.NeedLogin = a.cfg.NeedLogin || !st.LoggedIn
+		st.NoNodes = a.cfg.NoNodes
+		st.Account = a.cfg.User
+		st.Plan = a.cfg.Plan
+	} else {
+		st.NeedLogin = !st.LoggedIn
 	}
 	return st
 }

@@ -46,6 +46,7 @@ struct RootView: View {
     enum Page: String, CaseIterable, Identifiable {
         case home = "连接首页"
         case nodes = "节点列表"
+        case account = "我的账号"
         case settings = "偏好设置"
         case about = "关于"
 
@@ -55,6 +56,7 @@ struct RootView: View {
             switch self {
             case .home: return "house"
             case .nodes: return "globe"
+            case .account: return "person.crop.circle"
             case .settings: return "gearshape"
             case .about: return "info.circle"
             }
@@ -146,6 +148,7 @@ struct RootView: View {
         switch page {
         case .home: HomeView()
         case .nodes: NodesView()
+        case .account: AccountView()
         case .settings: SettingsView()
         case .about: AboutView()
         }

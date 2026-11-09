@@ -44,6 +44,12 @@ func SettingsFile() string { return filepath.Join(StateDir(), "settings.json") }
 // DeviceKeyFile 返回统计上报的设备标识。
 func DeviceKeyFile() string { return filepath.Join(StateDir(), "device.key") }
 
+// UserTokenFile 返回登录后的用户令牌（0600）。
+//
+// 后台 1.9 起按用户套餐下发节点，令牌等价于账号：只有 root 可读，
+// 退出登录时删除。与移动端 mobile 包用的是同一个文件名，便于排查。
+func UserTokenFile() string { return filepath.Join(StateDir(), "user.token") }
+
 // SocketPath 是界面进程与特权组件通信的 unix socket。
 func SocketPath() string {
 	if v := os.Getenv("QYVPN_SOCKET"); v != "" {

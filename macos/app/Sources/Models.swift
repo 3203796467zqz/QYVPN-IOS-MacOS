@@ -70,6 +70,18 @@ struct EngineStatus: Codable {
     var isBusy: Bool { state == "connecting" || state == "reconnecting" || state == "disconnecting" }
     var isConnected: Bool { state == "connected" }
 
+    // 账号态（后台 1.9 起节点按套餐下发）。
+    // 用可选类型而不是带默认值的 Bool：内核没下发这个键时（旧版本），
+    // Swift 合成的 Decodable 会因 keyNotFound 整体解码失败。
+    var needLogin: Bool?
+    var loggedIn: Bool?
+    var noNodes: Bool?
+    var account: UserAccount?
+    var plan: PlanInfo?
+
+    /// 需要登录：以后台说法为准，本地没有令牌时也算。
+    var needsLogin: Bool { needLogin ?? !(loggedIn ?? false) }
+
     var title: String {
         switch state {
         case "connected": return "节点通道已连接"
@@ -86,6 +98,49 @@ struct EngineStatus: Codable {
         let m = (duration % 3600) / 60
         let s = duration % 60
         return String(format: "%02d:%02d:%02d", h, m, s)
+    }
+}
+
+/// 账号信息（对应后台 userView）。
+struct UserAccount: Codable {
+    var id: String = ""
+    var username: String = ""
+    var email: String = ""
+    var member: String = ""
+    var type: String = ""
+    var expire: String = ""
+    var active: Bool = false
+    var daysLeft: Int = 0
+    var created: String = ""
+    var lastLogin: String = ""
+    var platform: String = ""
+    var disabled: Bool = false
+    var note: String = ""
+    var planId: String = ""
+    var planName: String = ""
+
+    /// 「会员 · 剩余 30 天」这类一行摘要。
+    var summary: String {
+        var parts: [String] = []
+        if !type.isEmpty { parts.append(type) }
+        if active, daysLeft > 0 {
+            parts.append("剩余 \(daysLeft) 天")
+        } else if !active {
+            parts.append("未激活")
+        }
+        if !expire.isEmpty { parts.append("到期 \(expire)") }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// 当前套餐摘要（后台 plan: {id, name, nodes}）。
+struct PlanInfo: Codable {
+    var id: String = ""
+    var name: String = ""
+    var nodes: Int = 0
+
+    var summary: String {
+        name.isEmpty ? "\(nodes) 台节点" : "\(name) · \(nodes) 台节点"
     }
 }
 
@@ -126,6 +181,10 @@ struct EngineResponse: Codable {
     var log: [String]?
     var update: UpdateInfo?
     var path: String?
+
+    // 卡密兑换结果。
+    var days: Int?
+    var expire: String?
 }
 
 /// 数值格式化（与 Android / Windows 客户端同一套规则）。

@@ -120,9 +120,49 @@ chmod 0755 "$OUT/engine/qyvpn-engine"
 echo "    内核架构：$(lipo -archs "$OUT/engine/qyvpn-engine" 2>/dev/null || echo 通用二进制)"
 
 echo "==> 编译界面"
+# 只有完整版 Xcode 才带 XCBuild.framework。只装了命令行工具（xcode-select 装的）的机器上，
+# 一旦给 swift build 传 --arch（编通用二进制），就会报：
+#   error: xcbuild executable at .../XCBuild.framework/.../xcbuild does not exist
+# 所以这里先试目标架构，失败且是缺 XCBuild，就退回本机架构，保证一定能出包。
+NATIVE_ARCH="$(uname -m)"          # arm64 或 x86_64
 ARCH_FLAGS=()
-for arch in "${ARCHS[@]}"; do ARCH_FLAGS+=(--arch "$arch"); done
-( cd "$ROOT/app" && swift build -c release "${ARCH_FLAGS[@]}" )
+
+# 判断装的是完整 Xcode 还是只有命令行工具：只有完整 Xcode 带 XCBuild.framework。
+XCODE_DEV="$(xcode-select -p 2>/dev/null || true)"
+case "$XCODE_DEV" in
+  *.app/Contents/Developer) HAS_FULL_XCODE=1 ;;
+  *) HAS_FULL_XCODE=0 ;;
+esac
+
+if [ "${#ARCHS[@]}" -gt 1 ] && [ "$HAS_FULL_XCODE" = "0" ]; then
+  echo "    这台 Mac 只有 Xcode 命令行工具（$XCODE_DEV），缺 XCBuild，编不出通用二进制。"
+  echo "    改为只编本机架构（$NATIVE_ARCH）；想同时支持 Apple Silicon 与 Intel，"
+  echo "    需要安装完整版 Xcode（App Store，约 10 GB）。"
+  ARCHS=("$NATIVE_ARCH")
+fi
+
+if [ "${#ARCHS[@]}" -eq 1 ] && [ "${ARCHS[0]}" = "$NATIVE_ARCH" ]; then
+  echo "    目标架构与本机一致（$NATIVE_ARCH），不指定 --arch，直接本地编译"
+else
+  for arch in "${ARCHS[@]}"; do ARCH_FLAGS+=(--arch "$arch"); done
+  echo "    目标架构：${ARCHS[*]}"
+fi
+
+UI_LOG="$OUT/swift-build.log"
+set +e
+( cd "$ROOT/app" && swift build -c release "${ARCH_FLAGS[@]}" ) 2>&1 | tee "$UI_LOG"
+UI_RC=${PIPESTATUS[0]}
+set -e
+
+if [ "$UI_RC" -ne 0 ] && [ "${#ARCH_FLAGS[@]}" -gt 0 ] && grep -q "xcbuild" "$UI_LOG" 2>/dev/null; then
+  echo
+  echo "    这台 Mac 只有 Xcode 命令行工具，缺 XCBuild，编不出通用二进制。"
+  echo "    改为只编本机架构（$NATIVE_ARCH），出包继续进行。"
+  echo "    想同时支持 Apple Silicon 与 Intel，需要安装完整版 Xcode（App Store，约 10 GB）。"
+  ARCHS=("$NATIVE_ARCH")
+  ARCH_FLAGS=()
+  ( cd "$ROOT/app" && swift build -c release ) 2>&1 | tee "$UI_LOG"
+fi
 
 BIN_DIR="$( cd "$ROOT/app" && swift build -c release "${ARCH_FLAGS[@]}" --show-bin-path )"
 UI_BIN="$BIN_DIR/QingyouPrivateCloud"
@@ -130,6 +170,7 @@ if [ ! -f "$UI_BIN" ]; then
   UI_BIN="$(find "$ROOT/app/.build" -type f -name QingyouPrivateCloud -perm -111 | head -1)"
 fi
 [ -f "$UI_BIN" ] || { echo "找不到界面可执行文件"; exit 1; }
+echo "    界面架构：$(lipo -archs "$UI_BIN" 2>/dev/null || echo 未知)"
 
 echo "==> 组装 .app"
 rm -rf "$APP"

@@ -80,26 +80,45 @@ struct NodesView: View {
     private var emptyState: some View {
         VStack(spacing: 12) {
             Spacer()
-            Image(systemName: "globe.asia.australia")
+            Image(systemName: state.engineReady && !state.status.needsLogin
+                  ? "globe.asia.australia" : "person.crop.circle.badge.exclamationmark")
                 .font(.system(size: 40))
                 .foregroundStyle(Color.inkSecondary)
-            Text(state.engineReady ? "还没有可用节点" : "连接内核尚未就绪")
+            Text(emptyTitle)
                 .font(.system(size: 14, weight: .medium))
-            Text(state.engineReady ? "请检查网络后刷新节点列表" : "请先在首页安装网络组件")
+            Text(emptyHint)
                 .font(.system(size: 12))
                 .foregroundStyle(Color.inkSecondary)
-            if state.engineReady {
-                Button("刷新节点") { state.refreshNodes() }
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+            if !state.engineReady {
+                Button("安装网络组件") { state.installHelper() }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.brandBlue)
-            } else {
-                Button("安装网络组件") { state.installHelper() }
+            } else if !state.status.needsLogin {
+                Button("刷新节点") { state.refreshNodes() }
                     .buttonStyle(.borderedProminent)
                     .tint(Color.brandBlue)
             }
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyTitle: String {
+        if !state.engineReady { return "连接内核尚未就绪" }
+        if state.status.needsLogin { return "请先登录账号" }
+        if state.status.noNodes == true { return "当前套餐没有可用节点" }
+        return "还没有可用节点"
+    }
+
+    private var emptyHint: String {
+        if !state.engineReady { return "请先在首页安装网络组件" }
+        // 后台 1.9 起节点按套餐下发，未登录时列表必然是空的：
+        // 直接说清楚，否则用户会以为是网络或软件坏了。
+        if state.status.needsLogin { return "节点按账号套餐下发，登录后才会显示。可在「我的账号」登录或注册。" }
+        if state.status.noNodes == true { return "账号已登录，但套餐里还没有分配节点，或本月流量已用完。可在「我的账号」用卡密开通会员，或联系管理员。" }
+        return "请检查网络后刷新节点列表"
     }
 }
 
