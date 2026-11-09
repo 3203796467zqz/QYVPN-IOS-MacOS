@@ -142,28 +142,85 @@ func installHelper(token string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(paths.HelperBinary()), 0o755); err != nil {
-		return err
+	dir := filepath.Dir(paths.HelperBinary())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建 %s 失败：%w", dir, err)
 	}
+	_ = os.Chown(dir, 0, 0)
+	_ = os.Chmod(dir, 0o755)
+
 	// 复制自身到特权目录；若已经在目标位置运行则跳过，避免覆盖正在执行的二进制。
 	if filepath.Clean(self) != filepath.Clean(paths.HelperBinary()) {
 		data, err := os.ReadFile(self)
 		if err != nil {
-			return err
+			return fmt.Errorf("读取内核可执行文件失败：%w", err)
 		}
 		if err := os.WriteFile(paths.HelperBinary(), data, 0o755); err != nil {
-			return err
+			return fmt.Errorf("写入 %s 失败：%w", paths.HelperBinary(), err)
 		}
 	}
 	if err := os.Chmod(paths.HelperBinary(), 0o755); err != nil {
 		return err
 	}
 	_ = os.Chown(paths.HelperBinary(), 0, 0)
+	// 从「下载来的 App」里带出的 com.apple.quarantine 会让 launchd 拒绝加载，
+	// 表现就是 Bootstrap failed: 5: Input/output error。复制出的新文件通常没有，
+	// 但用户从浏览器/网盘解压时属性可能被继承，这里统一清一遍。
+	clearXattrs(paths.HelperBinary())
 
 	if err := ipc.WriteToken(token); err != nil {
 		return err
 	}
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+
+	// launchd 要能打开 StandardOutPath，否则可能因为打不开日志而加载失败。
+	logPath := "/Library/Logs/cn.qo8.qyvpn.engine.log"
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return fmt.Errorf("创建 /Library/Logs 失败：%w", err)
+	}
+	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		_ = f.Close()
+	}
+
+	// ProcessType 不要写 Interactive：那是给与窗口服务器交互的作业用的，
+	// 系统域的守护进程用默认值即可，写了反而可能被 launchd 拒绝。
+	plist := helperPlist(paths.HelperLabel, paths.HelperBinary(), logPath)
+
+	plistPath := paths.HelperPlist()
+	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+		return fmt.Errorf("写入 %s 失败：%w", plistPath, err)
+	}
+	// launchd 要求 plist 属于 root:wheel 且不可被其他用户写。
+	_ = os.Chown(plistPath, 0, 0)
+	_ = os.Chmod(plistPath, 0o644)
+	clearXattrs(plistPath)
+
+	// 1) 先卸掉可能残留的旧注册（上次安装失败、或换过路径）。
+	runQuiet("launchctl", "bootout", "system/"+paths.HelperLabel)
+	// 2) 如果这个 label 曾被 disable，bootstrap 会直接失败，先确保是启用状态。
+	runQuiet("launchctl", "enable", "system/"+paths.HelperLabel)
+
+	out, err := runCmd("launchctl", "bootstrap", "system", plistPath)
+	if err != nil {
+		// 3) 新接口失败时退回旧接口再试一次（老系统与个别被托管的环境仍吃这一套）。
+		if out2, err2 := runCmd("launchctl", "load", "-w", "-F", plistPath); err2 != nil {
+			return fmt.Errorf("launchctl bootstrap 失败：%s；load 兜底也失败：%s%s",
+				orNone(out), orNone(out2), diagnose())
+		}
+	}
+
+	// 4) 不轻信返回码：确认服务真的注册上了，否则界面会一直显示「未安装」。
+	if out, err := runCmd("launchctl", "print", "system/"+paths.HelperLabel); err != nil {
+		return fmt.Errorf("launchctl 报告成功但服务未注册：%s%s", orNone(out), diagnose())
+	}
+	return nil
+}
+
+// helperPlist 生成 LaunchDaemon 描述。
+//
+// 单独抽出来是为了能单测：launchd 对 plist 的要求很严（必须是合法 XML、Label 与方法名匹配），
+// 一旦写错只会得到 Bootstrap failed: 5，很难从现象反推。
+func helperPlist(label, binary, logPath string) string {
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -178,21 +235,66 @@ func installHelper(token string) error {
   <dict>
     <key>SuccessfulExit</key><false/>
   </dict>
-  <key>ProcessType</key><string>Interactive</string>
-  <key>StandardOutPath</key><string>/Library/Logs/cn.qo8.qyvpn.engine.log</string>
-  <key>StandardErrorPath</key><string>/Library/Logs/cn.qo8.qyvpn.engine.log</string>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>%s</string>
+  <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, paths.HelperLabel, paths.HelperBinary())
-	if err := os.WriteFile(paths.HelperPlist(), []byte(plist), 0o644); err != nil {
-		return err
+`, label, binary, logPath, logPath)
+}
+
+func runCmd(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+func runQuiet(name string, args ...string) {
+	_ = exec.Command(name, args...).Run()
+}
+
+// clearXattrs 清掉文件上的扩展属性（尤其是 com.apple.quarantine）。
+func clearXattrs(path string) {
+	if _, err := os.Stat("/usr/bin/xattr"); err != nil {
+		return
 	}
-	// 先卸载旧服务（忽略错误），再按新配置加载。
-	_ = exec.Command("launchctl", "bootout", "system/"+paths.HelperLabel).Run()
-	if out, err := exec.Command("launchctl", "bootstrap", "system", paths.HelperPlist()).CombinedOutput(); err != nil {
-		return fmt.Errorf("launchctl bootstrap 失败：%s %v", strings.TrimSpace(string(out)), err)
+	_ = exec.Command("/usr/bin/xattr", "-c", path).Run()
+}
+
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（无输出）"
 	}
-	return nil
+	return s
+}
+
+// diagnose 收集安装失败时的现场信息，一次性随错误抛出，省得来回问。
+func diagnose() string {
+	var b strings.Builder
+	if info, err := os.Stat(paths.HelperBinary()); err == nil {
+		fmt.Fprintf(&b, "；内核 %d 字节 权限 %v", info.Size(), info.Mode().Perm())
+	} else {
+		fmt.Fprintf(&b, "；内核不存在：%v", err)
+	}
+	if info, err := os.Stat(paths.HelperPlist()); err == nil {
+		fmt.Fprintf(&b, "；plist %d 字节 权限 %v", info.Size(), info.Mode().Perm())
+	} else {
+		fmt.Fprintf(&b, "；plist 不存在：%v", err)
+	}
+	if out, err := runCmd("launchctl", "print-disabled", "system"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, paths.HelperLabel) {
+				fmt.Fprintf(&b, "；disabled 覆盖：%s", strings.TrimSpace(line))
+			}
+		}
+	}
+	if data, err := os.ReadFile("/Library/Logs/cn.qo8.qyvpn.engine.log"); err == nil && len(data) > 0 {
+		tail := data
+		if len(tail) > 300 {
+			tail = tail[len(tail)-300:]
+		}
+		fmt.Fprintf(&b, "；内核日志尾部：%s", strings.TrimSpace(string(tail)))
+	}
+	return b.String()
 }
 
 func mustUninstall() {
