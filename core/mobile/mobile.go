@@ -8,9 +8,12 @@ package mobile
 // 编进扩展进程，界面与扩展之间只通过 NETunnelProviderManager 的 IPC 通信，
 // 而扩展与内核之间走同进程调用，用 gomobile bind 生成 ObjC 框架给 Swift 用。
 //
-// 对外只暴露四种类型：字符串（JSON）、整数、[]byte 和 Delegate 回调。
-// gomobile 不支持 Go 结构体跨语言传递，所以节点、状态、设置一律序列化成 JSON，
-// 由 Swift 侧用 Codable 解析。
+// 对外只暴露字符串（JSON）、整数与 []byte 三种类型。为什么不用回调：gomobile 把 Go
+// 接口映射到 ObjC 的类型形状不稳定（本次生成的是类而不是协议，Swift 无法实现），
+// 与其跟着生成器变，不如让宿主主动来取：
+//   - 下行包：ReadPacket() 阻塞读（宿主用一条后台线程循环取）
+//   - 隧道就绪：TunnelInfoJSON() 轮询（IPCP 完成后才有内容）
+// gomobile 不支持 Go 结构体跨语言传递，所以节点、状态、设置一律序列化成 JSON。
 
 import (
 	"context"
@@ -35,30 +38,12 @@ import (
 // 与 Info.plist 的 CFBundleShortVersionString 保持一致。
 var Version = "1.0.0"
 
-// Delegate 把内核的数据面与生命周期事件推给扩展进程。
-//
-// 三个方法都在后台协程里调用，宿主实现必须自己保证线程安全；
-// OnPacket 是热路径，每秒可能上千次，里面不要做重活。
-//
-// 参数只用 string 与 []byte：gomobile 生成的 ObjC 签名里分别对应 NSString 与
-// NSData，跨语言最稳；结构化的内容一律用 JSON 传，避免为类型映射踩坑。
-type Delegate interface {
-	// OnPacket 交付一个下行 IP 包（已经复制过，宿主可以持有）。
-	OnPacket(p []byte)
-	// OnTunnelReady 在 IPCP 完成后回调，参数是
-	// {"ip":"10.77.88.11","dns":["10.77.88.1"],"mtu":1400}。
-	// 宿主必须在这里配置 NEPacketTunnelNetworkSettings，之后才开始 readPackets。
-	OnTunnelReady(configJSON string)
-	// OnLog 输出一行连接日志。
-	OnLog(line string)
-}
-
 // Engine 是一次客户端运行期唯一的连接内核。
 type Engine struct {
 	mu       sync.Mutex
 	agent    *agent.Agent
 	tun      *packetTunnel
-	delegate Delegate
+	ready    string // IPCP 完成后的隧道参数 JSON，空表示未就绪
 	stateDir string
 	closed   bool
 }
@@ -162,9 +147,8 @@ func (e *Engine) Logout() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = e.agent.Client().Logout(ctx)
-	if err := e.clearUserToken(); err != nil {
-		e.logf("清理登录态失败：%v", err)
-	}
+	// 清理失败不致命：令牌已经在内存里清掉了，磁盘上残留会在下次登录时被覆盖。
+	_ = e.clearUserToken()
 	// 清掉内存里的节点，避免退出登录后仍显示上一账号的节点。
 	_ = e.agent.Refresh(context.Background())
 }
@@ -195,17 +179,32 @@ func (e *Engine) PlanJSON() string {
 	return "null"
 }
 
-// SetDelegate 注册回调。必须在 Connect 之前调用。
-func (e *Engine) SetDelegate(d Delegate) {
-	e.mu.Lock()
-	e.delegate = d
-	e.mu.Unlock()
-}
-
-func (e *Engine) currentDelegate() Delegate {
+// TunnelInfoJSON 返回隧道参数，内核还没走到 IPCP 时返回空字符串。
+//
+// 扩展进程轮询它：一旦拿到内容，就按里面的 ip/dns/mtu 配置
+// NEPacketTunnelNetworkSettings，然后才开始搬包。
+func (e *Engine) TunnelInfoJSON() string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.delegate
+	return e.ready
+}
+
+// ReadPacket 阻塞等待一个下行 IP 包；隧道未建立或已关闭时返回 nil。
+//
+// 宿主用一条后台线程死循环调用它，取到包就写进 NEPacketTunnelFlow。
+// 阻塞在 cgo 调用上是安全的：Go 侧只是在 channel 上等待，不会占住系统线程做忙等。
+func (e *Engine) ReadPacket() []byte {
+	e.mu.Lock()
+	tun := e.tun
+	e.mu.Unlock()
+	if tun == nil {
+		return nil
+	}
+	pkt, ok := tun.TakeOutbound()
+	if !ok {
+		return nil
+	}
+	return pkt
 }
 
 // Refresh 从后台拉一次节点与在线状态。令牌失效时清掉本地登录态，
@@ -215,18 +214,9 @@ func (e *Engine) Refresh() error {
 	defer cancel()
 	err := e.agent.Refresh(ctx)
 	if err != nil && cloud.NeedLogin(err) {
-		if clearErr := e.clearUserToken(); clearErr != nil {
-			e.logf("清理失效登录态失败：%v", clearErr)
-		}
+		_ = e.clearUserToken()
 	}
 	return err
-}
-
-// logf 把内核日志转给宿主（扩展写入 os_log，界面在「连接日志」里显示）。
-func (e *Engine) logf(format string, args ...any) {
-	if d := e.currentDelegate(); d != nil {
-		d.OnLog(fmt.Sprintf(format, args...))
-	}
 }
 
 // NodesJSON 返回节点列表（不含密码），字段与 macOS 客户端一致。
@@ -266,6 +256,10 @@ func (e *Engine) Connect(nodeID string) error {
 	if e.agent.Client().UserToken() == "" || e.agent.NeedLogin() {
 		return errors.New("登录已失效，请回到 App 重新登录")
 	}
+	// 清掉上一次的隧道参数：否则扩展会拿着旧地址去配置系统隧道。
+	e.mu.Lock()
+	e.ready = ""
+	e.mu.Unlock()
 	return e.agent.Connect(nodeID)
 }
 
@@ -323,6 +317,7 @@ func (e *Engine) Close() {
 	e.closed = true
 	tun := e.tun
 	e.tun = nil
+	e.ready = ""
 	e.mu.Unlock()
 
 	if tun != nil {
@@ -331,39 +326,24 @@ func (e *Engine) Close() {
 	e.agent.Close()
 }
 
-// openTunnel 是给 agent 注入的隧道实现：不开 utun，只把包交给宿主。
+// openTunnel 是给 agent 注入的隧道实现：不开 utun，只把包留在内存队列里等宿主来取。
 func (e *Engine) openTunnel(ip net.IP, dns []net.IP, mtu int, _ tunnel.Options) (session.Tunnel, error) {
 	tun := newPacketTunnel()
+	parts := make([]string, 0, len(dns))
+	for _, v := range dns {
+		parts = append(parts, v.String())
+	}
+	ready := marshal(map[string]any{
+		"ip":  ip.String(),
+		"dns": parts,
+		"mtu": mtu,
+	})
+
 	e.mu.Lock()
 	e.tun = tun
+	e.ready = ready
 	e.mu.Unlock()
-
-	if d := e.currentDelegate(); d != nil {
-		parts := make([]string, 0, len(dns))
-		for _, v := range dns {
-			parts = append(parts, v.String())
-		}
-		d.OnTunnelReady(marshal(map[string]any{
-			"ip":  ip.String(),
-			"dns": parts,
-			"mtu": mtu,
-		}))
-	}
-	go e.pumpOutbound(tun)
 	return tun, nil
-}
-
-// pumpOutbound 独占一个协程把下行包投给宿主，避免阻塞 TLS 读取循环。
-func (e *Engine) pumpOutbound(t *packetTunnel) {
-	for {
-		pkt, ok := t.TakeOutbound()
-		if !ok {
-			return
-		}
-		if d := e.currentDelegate(); d != nil {
-			d.OnPacket(pkt)
-		}
-	}
 }
 
 func marshal(v any) string {

@@ -5,10 +5,13 @@
 // 也不允许常驻后台，所有 VPN 数据必须由系统启动的这个扩展进程接管。
 // 扩展里做三件事：
 //   1. 创建 Go 内核（gomobile 编出来的 Engine 框架），把用户令牌与节点 ID 交给它；
-//   2. 内核完成 IPCP 后回调 OnTunnelReady，这里据真实地址/DNS/MTU 配置系统隧道，
+//   2. 轮询内核的隧道参数，IPCP 完成后按真实地址/DNS/MTU 配置系统隧道，
 //      并把节点服务器与后台域名从隧道路由里排除，避免自己的流量绕回隧道；
-//   3. 双向搬包：packetFlow.readPackets → 内核；内核 OnPacket → packetFlow.writePackets。
-//      同时每秒把内核状态写进 App Group，供主 App 显示。
+//   3. 双向搬包：packetFlow.readPackets → 内核；内核 ReadPacket() → packetFlow.writePackets。
+//
+// 为什么用「轮询 + 阻塞读」而不是回调：gomobile 把 Go 接口映射成 ObjC 类型时形状并不
+// 稳定（本项目实测生成的是类而不是协议，Swift 无法实现），跟着生成器改签名太脆弱。
+// 现在内核只暴露 ReadPacket / TunnelInfoJSON / StatusJSON 三个普通方法，跨语言面最小。
 
 import NetworkExtension
 import os.log
@@ -18,19 +21,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let log = OSLog(subsystem: "cn.qo8.qyvpn.client.tunnel", category: "tunnel")
 
-    /// 所有与内核、packetFlow 相关的状态都收敛到这条串行队列上，
-    /// 因为 OnPacket 可能来自多个 Go 协程，而 packetFlow 的回调也是系统线程。
+    /// 所有与内核、packetFlow 相关的状态都收敛到这条串行队列上。
     private let queue = DispatchQueue(label: "cn.qo8.qyvpn.tunnel.work")
 
     private var engine: MobileEngine?
     private var tunnelReady = false
-    private var pendingDownlink: [Data] = []
+    private var stopped = false
     private var statusTimer: DispatchSourceTimer?
+    private var readyTimer: DispatchSourceTimer?
     private var excludedCIDRs: [String] = []
-
-    /// pendingDownlink 的上限：隧道配置好之前最多缓存 64 个包（约 90 KB），
-    /// 再多就丢，避免扩展刚启动时被内存上限打死。
-    private let maxPending = 64
 
     // MARK: - 生命周期
 
@@ -52,11 +51,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             do {
                 // 客户端令牌已在编译期注入 Go 二进制（见 ios/build.sh），这里传空。
                 let engine = try MobileNewEngine(dir.path, bootstrap.apiBase, "")
-                engine.setDelegate(self)
                 try engine.setUserToken(bootstrap.token)
                 self.engine = engine
 
-                // 同步拉一次节点：扩展进程需要自己拿到节点口令才能连 SSTP。
+                // 扩展进程自己拉一次节点：SSTP 登录口令在这里。
                 try engine.refresh()
 
                 // 连接参数里只有节点 ID，服务器地址要从节点列表里取出来再解析成
@@ -69,9 +67,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
 
                 try engine.connect(bootstrap.nodeId)
-
                 self.startStatusTimer()
-                completionHandler(nil)
+                self.pollTunnelInfo(completionHandler)
             } catch {
                 self.writeStatus(raw: self.failureStatus(error.localizedDescription))
                 completionHandler(error)
@@ -86,8 +83,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler()
                 return
             }
+            self.stopped = true
             self.statusTimer?.cancel()
             self.statusTimer = nil
+            self.readyTimer?.cancel()
+            self.readyTimer = nil
             self.engine?.disconnect()
             self.engine?.close()
             self.engine = nil
@@ -96,9 +96,60 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    // MARK: - 等内核走到 IPCP
+
+    /// 轮询 TunnelInfoJSON。IPCP 完成后立刻配置隧道；连接失败则提前返回错误，
+    /// 否则系统会一直显示「正在连接」直到用户放弃。
+    private func pollTunnelInfo(_ completionHandler: @escaping (Error?) -> Void) {
+        var attempts = 0
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
+        timer.setEventHandler { [weak self] in
+            guard let self, let engine = self.engine else { return }
+            attempts += 1
+
+            let infoJSON = engine.tunnelInfoJSON()
+            if !infoJSON.isEmpty,
+               let data = infoJSON.data(using: .utf8),
+               let info = try? JSONDecoder().decode(TunnelReadyInfo.self, from: data) {
+                timer.cancel()
+                self.readyTimer = nil
+                self.configureTunnel(info: info) { ok in
+                    guard ok else {
+                        completionHandler(TunnelStartError.configureFailed)
+                        return
+                    }
+                    self.startPacketPumps()
+                    completionHandler(nil)
+                }
+                return
+            }
+
+            // 每 5 秒看一次内核状态：已经回到 idle 且带错误，说明连不上，别再等。
+            if attempts % 25 == 0 {
+                if let st = engine.statusJSON().data(using: .utf8),
+                   let status = try? JSONDecoder().decode(EngineStatus.self, from: st),
+                   status.state == "idle",
+                   let err = status.error, !err.isEmpty {
+                    timer.cancel()
+                    self.readyTimer = nil
+                    completionHandler(TunnelStartError.inner(err))
+                    return
+                }
+            }
+            // 60 秒还没完成 IPCP，按超时处理。
+            if attempts > 300 {
+                timer.cancel()
+                self.readyTimer = nil
+                completionHandler(TunnelStartError.timeout)
+            }
+        }
+        timer.resume()
+        readyTimer = timer
+    }
+
     // MARK: - 隧道配置
 
-    /// 内核完成 IPCP：按真实地址配置系统隧道，然后开始搬包。
     private func configureTunnel(info: TunnelReadyInfo, completion: @escaping (Bool) -> Void) {
         let remote = excludedCIDRs.first ?? info.ip
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: remote)
@@ -122,18 +173,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             if let error {
-                os_log("配置隧道失败：%{public}@", log: self.log, type: .error, error.localizedDescription)
+                os_log("配置隧道失败：%{public}@", log: self.log, type: .error,
+                       error.localizedDescription)
                 completion(false)
                 return
             }
             self.queue.async {
                 self.tunnelReady = true
-                // 把配置隧道期间攒下的下行包一次性补写。
-                if !self.pendingDownlink.isEmpty {
-                    self.writeDownlink(self.pendingDownlink)
-                    self.pendingDownlink.removeAll()
-                }
-                self.startReading()
                 completion(true)
             }
         }
@@ -146,16 +192,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var seen = Set<String>()
 
         for cidr in excludedCIDRs {
-            guard let (address, mask) = PacketTunnelProvider.splitCIDR(cidr), !seen.contains(cidr) else {
-                continue
-            }
+            guard let (address, mask) = PacketTunnelProvider.splitCIDR(cidr),
+                  !seen.contains(cidr) else { continue }
             seen.insert(cidr)
             routes.append(NEIPv4Route(destinationAddress: address, subnetMask: mask))
         }
 
         // 台账里没解析出服务器地址时，至少把后台域名排除掉，保证还能刷新节点。
-        for host in PacketTunnelProvider.resolveIPv4(SharedConfig.apiBase
-            .replacingOccurrences(of: "https://", with: "")) {
+        let apiHost = SharedConfig.apiBase.replacingOccurrences(of: "https://", with: "")
+        for host in PacketTunnelProvider.resolveIPv4(apiHost) {
             let cidr = "\(host)/32"
             guard !seen.contains(cidr) else { continue }
             seen.insert(cidr)
@@ -166,25 +211,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - 数据面
 
-    private func startReading() {
+    private func startPacketPumps() {
+        startReadingFromHost()
+        startReadingFromEngine()
+    }
+
+    /// 上行：packetFlow → 内核。
+    private func startReadingFromHost() {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self else { return }
-            // 统一回到串行队列：引擎实例与 tunnelReady 都只在队列上读写。
             self.queue.async {
-                guard let engine = self.engine, self.tunnelReady else { return }
+                guard let engine = self.engine, self.tunnelReady, !self.stopped else { return }
                 for packet in packets {
                     _ = try? engine.writePacket(packet)
                 }
                 // readPackets 是一次性的，必须每次读完继续挂上下一次。
-                self.startReading()
+                self.startReadingFromHost()
             }
         }
     }
 
-    private func writeDownlink(_ packets: [Data]) {
-        guard !packets.isEmpty else { return }
-        let protos = packets.map { NSNumber(value: PacketTunnelProvider.protocolFamily($0)) }
-        packetFlow.writePackets(packets, withProtocols: protos)
+    /// 下行：内核 → packetFlow。ReadPacket 是阻塞调用，所以单独占一条线程。
+    private func startReadingFromEngine() {
+        guard let engine else { return }
+        Thread.detachNewThread { [weak self] in
+            while true {
+                guard let self, !self.stopped else { return }
+                guard let packet = engine.readPacket() else {
+                    // 隧道关闭时返回 nil，退出循环（不能重试，否则会空转）。
+                    return
+                }
+                let family = PacketTunnelProvider.protocolFamily(packet)
+                self.packetFlow.writePackets([packet], withProtocols: [NSNumber(value: family)])
+            }
+        }
     }
 
     private static func protocolFamily(_ packet: Data) -> Int32 {
@@ -206,8 +266,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func writeStatus(raw: String) {
-        guard let url = SharedConfig.statusFileURL else { return }
-        guard let data = raw.data(using: .utf8) else { return }
+        guard let url = SharedConfig.statusFileURL, let data = raw.data(using: .utf8) else { return }
         // 原子写：主 App 每秒读一次，不能让它读到半个 JSON。
         try? data.write(to: url, options: .atomic)
     }
@@ -232,48 +291,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 }
 
-// MARK: - 内核回调
-
-extension PacketTunnelProvider: MobileDelegate {
-    /// 下行 IP 包。隧道还没配置好时先攒着，配置完成后补写。
-    func onPacket(_ p: Data?) {
-        guard let p else { return }
-        queue.async { [weak self] in
-            guard let self else { return }
-            if self.tunnelReady {
-                self.writeDownlink([p])
-            } else if self.pendingDownlink.count < self.maxPending {
-                self.pendingDownlink.append(p)
-            }
-        }
-    }
-
-    /// IPCP 完成：这里必须完成系统隧道配置，否则不会有任何包流动。
-    func onTunnelReady(_ configJSON: String?) {
-        guard let configJSON, let data = configJSON.data(using: .utf8),
-              let info = try? JSONDecoder().decode(TunnelReadyInfo.self, from: data) else {
-            return
-        }
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.configureTunnel(info: info) { ok in
-                os_log("隧道配置%@", log: self.log, type: ok ? .info : .error,
-                       ok ? "完成" : "失败")
-            }
-        }
-    }
-
-    func onLog(_ line: String?) {
-        guard let line else { return }
-        os_log("%{public}@", log: log, type: .info, line)
-    }
-}
-
 // MARK: - 工具
 
 enum TunnelStartError: LocalizedError {
     case badConfiguration
     case missingAppGroup
+    case configureFailed
+    case timeout
+    case inner(String)
 
     var errorDescription: String? {
         switch self {
@@ -281,6 +306,12 @@ enum TunnelStartError: LocalizedError {
             return "启动参数缺失，请重新打开 App 后重试"
         case .missingAppGroup:
             return "App Group 未配置，扩展无法读写状态目录"
+        case .configureFailed:
+            return "系统拒绝配置隧道路由"
+        case .timeout:
+            return "连接节点超时，请检查网络后重试"
+        case .inner(let message):
+            return message
         }
     }
 }

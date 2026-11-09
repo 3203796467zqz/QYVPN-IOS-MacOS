@@ -119,10 +119,12 @@ QYVPN_TEAM=你的TeamID ./build.sh
 两个 target 的 App Group 没绑到同一个 `group.cn.qo8.qyvpn`；
 检查 `Resources/*.entitlements` 与开发者后台是否一致。
 
-**Swift 报 `MobileDelegate` 方法签名不匹配**
-gomobile 生成的头文件在 `app/Frameworks/Engine.xcframework/ios-arm64/Engine.framework/Headers/Engine.h`。
-打开它看 `@protocol MobileDelegate` 的实际签名（`NSData*` 还是 `Data?`），
-按头文件把 `PacketTunnelProvider` 里的三个回调签名改成一致即可。
+**Swift 报某个 `MobileXxx` 类型不是协议 / 方法签名不匹配**
+gomobile 生成的类型形状会随版本变化（本项目踩过一次：Go 接口被生成成类而不是协议）。
+当前设计已经避开了这个问题——内核不再用回调，扩展只调 `readPacket()` /
+`tunnelInfoJSON()` / `statusJSON()` 三个普通方法。若仍报错，打开
+`app/Frameworks/Engine.xcframework/ios-arm64/Engine.framework/Headers/Engine.h`
+按实际签名调整即可。
 
 **连上后所有网站都打不开**
 看扩展日志（Xcode → Window → Devices and Simulators → 选中设备 → Open Console，

@@ -87,9 +87,11 @@ Bundle ID、App Group 若要改，alter 三个地方：`ios/app/project.yml`、
 **提示「客户端未正确打包（缺少访问令牌）」**：构建时没有提供 `QYVPN_API_TOKEN`，
 Info.plist 里的 `QYVPNClientToken` 是空的。
 
-**`MobileDelegate` 方法签名不匹配**：gomobile 生成的头文件在
-`ios/app/Frameworks/Engine.xcframework/ios-arm64/Engine.framework/Headers/Engine.h`，
-按里面的 `@protocol MobileDelegate` 改 `PacketTunnelProvider` 的三个回调签名。
+**Swift 报 gomobile 生成的类型不是协议 / 方法对不上**：生成的类型形状会随 gomobile
+版本变化。当前设计不用回调——扩展只调 `readPacket()` / `tunnelInfoJSON()` /
+`statusJSON()` 三个普通方法。若仍报错，打开
+`ios/app/Frameworks/Engine.xcframework/ios-arm64/Engine.framework/Headers/Engine.h`
+按实际签名调整。
 
 **`saveToPreferences` 失败 / operation not permitted**：扩展的 App ID 没开
 Network Extensions，或描述文件缺少 `packet-tunnel-provider`。
