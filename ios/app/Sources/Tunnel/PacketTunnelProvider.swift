@@ -50,7 +50,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             do {
                 // 客户端令牌已在编译期注入 Go 二进制（见 ios/build.sh），这里传空。
-                let engine = try MobileNewEngine(dir.path, bootstrap.apiBase, "")
+                // MobileNewEngine 是 gomobile 生成的 C 函数（不是 ObjC 方法），
+                // Swift 不会把它桥接成 throws，必须自己传 NSError 指针。
+                var newError: NSError?
+                guard let engine = MobileNewEngine(dir.path, bootstrap.apiBase, "", &newError) else {
+                    throw newError ?? TunnelStartError.badConfiguration
+                }
                 try engine.setUserToken(bootstrap.token)
                 self.engine = engine
 
@@ -59,7 +64,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
                 // 连接参数里只有节点 ID，服务器地址要从节点列表里取出来再解析成
                 // /32 排除路由——否则隧道一起来，SSTP 自己的 TCP 连接就会被路由进去。
-                self.excludedCIDRs = Self.excludedRoutes(nodesJSON: engine.nodesJSON(),
+                self.excludedCIDRs = Self.excludedRoutes(nodesJSON: engine.nodesJSON() ?? "",
                                                          nodeID: bootstrap.nodeId)
                 if self.excludedCIDRs.isEmpty {
                     os_log("没有解析出节点地址，隧道可能因环路无法保持",
@@ -108,7 +113,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self, let engine = self.engine else { return }
             attempts += 1
 
-            let infoJSON = engine.tunnelInfoJSON()
+            let infoJSON = engine.tunnelInfoJSON() ?? ""
             if !infoJSON.isEmpty,
                let data = infoJSON.data(using: .utf8),
                let info = try? JSONDecoder().decode(TunnelReadyInfo.self, from: data) {
@@ -127,7 +132,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             // 每 5 秒看一次内核状态：已经回到 idle 且带错误，说明连不上，别再等。
             if attempts % 25 == 0 {
-                if let st = engine.statusJSON().data(using: .utf8),
+                if let st = (engine.statusJSON() ?? "").data(using: .utf8),
                    let status = try? JSONDecoder().decode(EngineStatus.self, from: st),
                    status.state == "idle",
                    let err = status.error, !err.isEmpty {
@@ -259,7 +264,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         timer.schedule(deadline: .now() + .milliseconds(500), repeating: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard let self, let engine = self.engine else { return }
-            self.writeStatus(raw: engine.statusJSON())
+            self.writeStatus(raw: engine.statusJSON() ?? "{}")
         }
         timer.resume()
         statusTimer = timer
