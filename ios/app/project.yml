@@ -19,7 +19,9 @@ name: QYVPN
 options:
   bundleIdPrefix: cn.qo8.qyvpn
   deploymentTarget:
-    iOS: "15.0"
+    # 界面用了 NavigationStack / scrollDismissesKeyboard 等 iOS 16 API；
+    # 2026 年 iOS 16 覆盖率已足够，不再为 15 做降级。
+    iOS: "16.0"
   createIntermediateGroups: true
   groupSortPosition: top
   generateEmptyDirectories: true
@@ -30,7 +32,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     CLANG_ENABLE_MODULES: YES
-    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     MARKETING_VERSION: "1.0.0"
     CURRENT_PROJECT_VERSION: "1"
 

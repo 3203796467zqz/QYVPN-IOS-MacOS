@@ -214,9 +214,19 @@ jobs:
             echo "::error::没有生成编译日志，脚本在更早阶段就退出了（检查工具链或路径）"
             exit 0
           fi
-          echo "===== 可能是错误行 ====="
-          grep -inE "go: |error|fatal|cannot|denied|failed|失败|错误|not found|no such file" "$LOG" \
-            | tail -6 | while IFS= read -r line; do echo "::error::$line"; done
+          echo "===== 编译错误（带 2 行上下文，合并成一条注解）====="
+          python3 - "$LOG" <<'PY2'
+          import re, sys
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+          picked = []
+          for i, line in enumerate(lines):
+              if re.search(r"error:", line):
+                  picked.extend(lines[i:i+3])
+                  if len(picked) >= 24:
+                      break
+          msg = "\n".join(picked).replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          print("::error::" + (msg[:9000] or "没有匹配到 Swift/Go 编译错误行"))
+          PY2
 
           echo "===== 日志末尾 45 行（合并成一条注解）====="
           python3 - "$LOG" <<'PY'

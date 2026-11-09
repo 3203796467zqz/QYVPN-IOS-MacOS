@@ -12,46 +12,53 @@ struct NodesView: View {
     var embedded = false
 
     var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 10) {
-                if model.nodes.isEmpty {
-                    emptyState
-                } else {
-                    ForEach(model.nodes) { node in
-                        nodeRow(node)
-                    }
-                    Text("共 \(model.nodes.count) 个节点 · 由后台按套餐下发")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color.inkSecondary)
-                        .padding(.top, 6)
-                }
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-        }
-        .background(Color.pageBackground)
-        .navigationTitle("节点")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button {
-                    Task { await model.probeAll() }
-                } label: {
-                    if model.probing {
-                        ProgressView()
+        // 自带 NavigationStack：既作为「节点」标签页使用，也会被首页以 sheet 方式弹出，
+        // 后一种情况没有外层导航容器，标题与工具栏就没了。
+        NavigationStack {
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    if model.nodes.isEmpty {
+                        emptyState
                     } else {
-                        Text("测速")
+                        ForEach(model.nodes) { node in
+                            nodeRow(node)
+                        }
+                        Text("共 \(model.nodes.count) 个节点 · 由后台按套餐下发")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.inkSecondary)
+                            .padding(.top, 6)
                     }
                 }
-                .disabled(model.probing || model.nodes.isEmpty)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
             }
-            if embedded {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("关闭") { dismiss() }
-                }
+            .background(Color.pageBackground)
+            .navigationTitle("节点")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { toolbarItems }
+            .refreshable { await model.refresh() }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarItems: some ToolbarContent {
+        if embedded {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button("关闭") { dismiss() }
             }
         }
-        .refreshable { await model.refresh() }
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Button {
+                Task { await model.probeAll() }
+            } label: {
+                if model.probing {
+                    ProgressView()
+                } else {
+                    Text("测速")
+                }
+            }
+            .disabled(model.probing || model.nodes.isEmpty)
+        }
     }
 
     private func nodeRow(_ node: NodeView) -> some View {
