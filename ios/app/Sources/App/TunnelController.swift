@@ -114,7 +114,9 @@ final class TunnelController: ObservableObject {
         // 清掉上一次的残留状态，避免界面先闪一下旧数据。
         clearStatusFile()
         engine = .idle
-        manager.connection.startVPNTunnel()
+        // 新 SDK 里 startVPNTunnel 是 throwing：配置没保存好、扩展未签名等都会抛错，
+        // 这里向上抛给界面显示，而不是静默失败让用户看着「未连接」发呆。
+        try manager.connection.startVPNTunnel()
         status = manager.connection.status
     }
 
