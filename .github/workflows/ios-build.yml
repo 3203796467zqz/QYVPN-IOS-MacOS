@@ -201,3 +201,29 @@ jobs:
               || echo "本次没有产生编译日志"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 失败时把日志关键行打成 GitHub 注解。
+      # 用它的原因很实际：Actions 的完整日志要仓库管理员权限才能通过 API 下载，
+      # 而注解（annotations）对公开仓库是匿名可读的 —— 这样不登录也能定位问题。
+      - name: 失败诊断
+        if: failure()
+        run: |
+          LOG="$GITHUB_WORKSPACE/ios-build.log"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::没有生成编译日志，脚本在更早阶段就退出了（检查工具链或路径）"
+            exit 0
+          fi
+          echo "===== 错误行 ====="
+          grep -nE "error:|error |错误|失败|fatal|not found|No such file|cannot|undefined" "$LOG" \
+            | tail -30 | while IFS= read -r line; do echo "::error::$line"; done
+          echo "===== 日志末尾 ====="
+          tail -30 "$LOG" | while IFS= read -r line; do echo "::error::$line"; done
+
+      - name: 上传编译日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log-${{ github.run_number }}
+          path: ios-build.log
+          if-no-files-found: ignore
+          retention-days: 7
